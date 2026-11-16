@@ -1,0 +1,14 @@
+# Copied to vendor/openshorts/docker-compose.override.yml on every machine that runs the pipeline.
+services:
+  backend:
+    # Loopback only, on 8001.
+    ports: !override
+      - "127.0.0.1:8001:8000"
+    environment:
+      # Full-bleed: scenes with no face fill the whole 9:16 frame (centre crop)
+      # instead of sitting small over a blurred copy. OpenShorts' default is 0.42.
+      - GENERAL_CONTENT_HEIGHT_RATIO=1.0
+  # The Remotion render service fails to start (upstream version mismatch) and
+  # clip generation does not use it, so it only starts when asked for by name.
+  renderer:
+    profiles: ["renderer"]

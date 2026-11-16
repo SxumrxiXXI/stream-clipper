@@ -1,0 +1,121 @@
+# The whole pipeline, once a day: find moments, make clips, schedule the posts,
+# pull views. The owner's settings, the posting queue and the detailed logs live
+# in a separate private repository; nothing about individual clips is printed
+# here, because this log is public.
+name: daily
+
+on:
+  # Started by hand until the hand-over from the owner's machine is done. Then:
+  # schedule:
+  #   - cron: "17 7 * * *"        # 09:17 in Cairo (winter time)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Make and plan clips but send nothing"
+        type: boolean
+        default: true
+      force:
+        description: "Run even if today's run already finished"
+        type: boolean
+        default: false
+      clips:
+        description: "How many clips to make (blank: the number in the settings)"
+        default: ""
+      state_branch:
+        description: "Branch of the private repository to save the records to"
+        default: "main"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+env:
+  TZ: Africa/Cairo
+  OPENSHORTS_COMMIT: 8af4a48a2bdda96c9a02bb8df3f09d4e7ec99e0f
+  OPENSHORTS_SERVICES: backend
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Private settings and records
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}-private
+          ssh-key: ${{ secrets.STATE_DEPLOY_KEY }}
+          path: private
+
+      - name: Link them into place
+        run: |
+          ln -s private/config config
+          ln -s private/data data
+          mkdir -p data/logs
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg unzip > /dev/null
+          pip install -q -r requirements.txt yt-dlp
+          mkdir -p tools
+          curl -sSL -o /tmp/tdl.zip https://github.com/lay295/TwitchDownloader/releases/download/1.56.5/TwitchDownloaderCLI-1.56.5-Linux-x64.zip
+          echo "f2bcee00d0e6da759d97c23767345634cb9cdb10cdff96cfa96f97983d51bf55  /tmp/tdl.zip" | sha256sum -c -
+          unzip -q -o /tmp/tdl.zip TwitchDownloaderCLI -d tools && chmod +x tools/TwitchDownloaderCLI
+
+      - name: OpenShorts
+        run: |
+          git clone -q https://github.com/mutonby/openshorts.git vendor/openshorts
+          git -C vendor/openshorts checkout -q "$OPENSHORTS_COMMIT"
+          cp deploy/openshorts.override.yml vendor/openshorts/docker-compose.override.yml
+          cd vendor/openshorts
+          # The container runs as its own user and writes into this checkout.
+          mkdir -p uploads output && chmod -R a+rwX .
+          docker compose build backend > /tmp/build.log 2>&1 || { tail -40 /tmp/build.log; exit 1; }
+          docker compose up -d --no-build backend
+
+      - name: Keys
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          UPLOAD_POST_API_KEY: ${{ secrets.UPLOAD_POST_API_KEY }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+        run: |
+          umask 077
+          printf 'GEMINI_API_KEY=%s\nUPLOAD_POST_API_KEY=%s\nTWITCH_CLIENT_ID=%s\nTWITCH_CLIENT_SECRET=%s\n' \
+            "$GEMINI_API_KEY" "$UPLOAD_POST_API_KEY" "$TWITCH_CLIENT_ID" "$TWITCH_CLIENT_SECRET" > .env
+          test -n "$GEMINI_API_KEY" || { echo "the keys are not set in this repository's secrets"; exit 1; }
+
+      - name: Daily run
+        env:
+          CLIP_DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '' }}
+          FORCE: ${{ inputs.force && '1' || '' }}
+          CLIPS: ${{ inputs.clips }}
+        run: |
+          args=(--quiet)
+          [ -n "$FORCE" ] && args+=(--force)
+          [[ "$CLIPS" =~ ^[0-9]+$ ]] && args+=(--clips "$CLIPS")
+          [ -n "$CLIP_DRY_RUN" ] && echo "trial: nothing will be sent to any platform"
+          python src/daily.py "${args[@]}"
+
+      - name: Save the records
+        if: always()
+        env:
+          STATE_BRANCH: ${{ inputs.state_branch || 'main' }}
+        run: |
+          [[ "$STATE_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad branch name"; exit 1; }
+          cd private
+          git config user.name "stream-clipper daily run"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "nothing new to save"; exit 0; fi
+          git commit -q -m "Daily run $(date +%F)"
+          git push -q --force origin "HEAD:refs/heads/${STATE_BRANCH}"
+          echo "records saved to the private repository (${STATE_BRANCH})"
