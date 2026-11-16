@@ -1,0 +1,82 @@
+# One-off check, started by hand: can a GitHub runner do the two things the
+# clipping pipeline depends on?
+#   1. read a public Twitch VOD (its chat replay and one short stretch of video)
+#   2. build and start the OpenShorts backend
+# It uses no secrets and none of this repository's code.
+name: probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      vod:
+        description: "Public Twitch VOD id"
+        required: true
+      start:
+        description: "Second of the VOD to cut an 84 s stretch from"
+        default: "4960"
+
+permissions:
+  contents: read
+
+jobs:
+  twitch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      VOD: ${{ inputs.vod }}
+      START: ${{ inputs.start }}
+    steps:
+      - name: Machine
+        run: |
+          echo "cores: $(nproc)"; lscpu | grep "Model name"; free -g | sed -n 1,2p; df -h / | tail -1
+      - name: Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg unzip > /dev/null
+          pipx install yt-dlp > /dev/null
+          curl -sSL -o tdl.zip https://github.com/lay295/TwitchDownloader/releases/download/1.56.5/TwitchDownloaderCLI-1.56.5-Linux-x64.zip
+          echo "f2bcee00d0e6da759d97c23767345634cb9cdb10cdff96cfa96f97983d51bf55  tdl.zip" | sha256sum -c -
+          unzip -q -o tdl.zip && chmod +x TwitchDownloaderCLI
+          yt-dlp --version; ffmpeg -version | head -1
+      - name: Chat replay of the whole stream
+        run: |
+          SECONDS=0
+          timeout 900 ./TwitchDownloaderCLI chatdownload --id "$VOD" -o chat.json > tdl.log 2>&1 || { tail -5 tdl.log; exit 1; }
+          python3 -c "import json; d=json.load(open('chat.json')); print(len(d['comments']), 'chat messages')"
+          echo "chat download took ${SECONDS}s, $(du -h chat.json | cut -f1)"
+      - name: One 84 s stretch of video
+        run: |
+          SECONDS=0
+          yt-dlp --no-warnings -q --download-sections "*${START}-$((START + 84))" --force-keyframes-at-cuts \
+            -f "best[height<=1080]/best" --merge-output-format mp4 -o window.mp4 "https://www.twitch.tv/videos/${VOD}"
+          echo "video stretch took ${SECONDS}s, $(du -h window.mp4 | cut -f1)"
+          ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate:format=duration -of default=nw=1 window.mp4
+
+  openshorts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Get OpenShorts at the version the pipeline uses
+        run: |
+          git clone -q https://github.com/mutonby/openshorts.git
+          git -C openshorts checkout -q 8af4a48a2bdda96c9a02bb8df3f09d4e7ec99e0f
+      - name: Build the backend image
+        working-directory: openshorts
+        run: |
+          SECONDS=0
+          docker compose build backend > build.log 2>&1 || { tail -40 build.log; exit 1; }
+          echo "build took ${SECONDS}s"
+          docker images --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
+          df -h / | tail -1
+      - name: Start it and wait until it answers
+        working-directory: openshorts
+        run: |
+          SECONDS=0
+          docker compose up -d --no-build backend
+          for i in $(seq 1 60); do
+            curl -fsS -m 5 http://127.0.0.1:8000/health/ready > /dev/null && break
+            sleep 3
+          done
+          curl -fsS -m 5 http://127.0.0.1:8000/health/ready > /dev/null || { docker compose logs --tail 40 backend; exit 1; }
+          echo "backend ready after ${SECONDS}s"
+          docker stats --no-stream --format '{{.Name}}  mem {{.MemUsage}}'
+          free -g | sed -n 1,2p
