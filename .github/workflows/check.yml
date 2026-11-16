@@ -1,4 +1,4 @@
-# Half an hour after each posting slot (13:35 stays until the last 13:00 post is out): ask the posting service whether every
+# Ten minutes after each posting slot (13:10 stays until the last 13:00 post is out): ask the posting service whether every
 # post that was due actually went out on every platform, and refresh the view
 # counts. If a post failed, this run fails, and GitHub emails the owner. Which
 # clip and which platform is written to the private repository, not here.
@@ -6,7 +6,7 @@ name: check
 
 on:
   schedule:
-    - cron: "35 1,11,16,20 * * *"   # 03:35, 13:35, 18:35 and 22:35 in Cairo (winter time)
+    - cron: "10 1,11,16,20 * * *"   # 03:10, 13:10, 18:10 and 22:10 in Cairo (winter time)
   workflow_dispatch:
 
 permissions:
@@ -59,7 +59,13 @@ jobs:
           log="data/logs/checks-$(date +%F).log"
           echo "===== check $(date '+%F %H:%M') =====" >> "$log"
           rc=0
-          python src/publish/post.py check >> "$log" 2>&1 || rc=$?
+          # A post can take a few minutes to reach all five platforms: look again
+          # every four minutes, up to five times, while one is still publishing.
+          for attempt in 1 2 3 4 5; do
+            python src/publish/post.py check >> "$log" 2>&1 || rc=$?
+            grep '^checked ' "$log" | tail -1 | grep -q ', 0 still publishing' && break
+            sleep 240
+          done
           python src/publish/post.py stats >> "$log" 2>&1 || true
           grep '^checked ' "$log" | tail -1 || true
           echo "rc=$rc" >> "$GITHUB_OUTPUT"

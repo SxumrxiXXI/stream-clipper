@@ -348,7 +348,7 @@ def _rows(res) -> dict[str, dict]:
     return found
 
 
-GRACE_MINUTES = 20        # how long after its slot a post may still be on its way
+GRACE_MINUTES = 6         # how soon after its slot a post is first asked about
 
 
 def outcome(res: dict, minutes_late: float) -> tuple[str, dict]:
@@ -385,7 +385,7 @@ def check(cfg: dict, items: list[dict]) -> int:
     """
     api = client()
     now = dt.datetime.now(dt.timezone.utc)
-    checked = problems = 0
+    checked = problems = waiting = 0
     for i in items:
         if i["status"] not in ("scheduled", "posted") or not i.get("request_id") or not i.get("scheduled_for"):
             continue
@@ -402,6 +402,7 @@ def check(cfg: dict, items: list[dict]) -> int:
         state, rows = outcome(res, late)
         checked += 1
         if state == "wait":
+            waiting += 1
             continue
         new = i.get("checked") != state                # say it once, not at every check
         i["checked"], i["results"] = state, rows
@@ -426,7 +427,7 @@ def check(cfg: dict, items: list[dict]) -> int:
             print(f"        {plat}: {err}")
         problems += 1 if new else 0
     save(items)
-    print(f"checked {checked} posts: {problems} with new problems")
+    print(f"checked {checked} posts: {problems} with new problems, {waiting} still publishing")
     return problems
 
 
