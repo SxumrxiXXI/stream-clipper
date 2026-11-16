@@ -70,6 +70,8 @@ jobs:
       - name: Start it and wait until it answers
         working-directory: openshorts
         run: |
+          # The container runs as its own user and writes into this checkout.
+          mkdir -p uploads output && chmod -R a+rwX .
           SECONDS=0
           docker compose up -d --no-build backend
           for i in $(seq 1 60); do
