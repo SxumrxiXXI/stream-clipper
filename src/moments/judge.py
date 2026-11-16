@@ -298,6 +298,7 @@ class Check(BaseModel):
     statement: str
     status: str                 # supported | contradicted | unverifiable
     evidence: str               # what was seen or heard, with its MM:SS
+    only_describes: bool        # it just narrates the action the viewer is watching
 
 
 class Checks(BaseModel):
@@ -321,6 +322,12 @@ For each statement decide:
 - contradicted: the video or transcript shows otherwise.
 - unverifiable: it may be true, but you cannot point to evidence for every part of it.
 Guessing "supported" is the one mistake that matters. When in doubt, answer unverifiable.
+
+Also answer only_describes for each statement: true if it merely narrates the action the
+viewer watches happen anyway ("he tries to catch a fish", "he shoots three players"); false
+if it adds something a casual viewer would not take from watching: the score or stakes,
+what was on the line, background on the person, what a rule or item means, or what the
+moment led to.
 
 Statements:
 {statements}
@@ -369,7 +376,7 @@ def verify(video: Path, statements: list[str], *, start: float, end: float,
         c = got[n] if n < len(got) else {}
         status = str(c.get("status", "")).lower().strip()
         out.append({"statement": x, "status": status if status in ("supported", "contradicted") else "unverifiable",
-                    "evidence": str(c.get("evidence", ""))[:200]})
+                    "evidence": str(c.get("evidence", ""))[:200], "only_describes": bool(c.get("only_describes"))})
     return out
 
 

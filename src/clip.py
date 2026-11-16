@@ -629,9 +629,12 @@ def main() -> None:
         except Exception as e:
             log(f"the context lines could not be checked ({str(e)[:120]}): making this clip the classic way")
             checks, fmt = [], "classic"
-        ok = {c["statement"]: c["status"] == "supported" for c in checks}
+        # A line must be true AND tell the viewer something they would not get from
+        # watching: a line that only narrates the action adds nothing of ours.
+        ok = {c["statement"]: c["status"] == "supported" and not c.get("only_describes") for c in checks}
         for c in checks:
-            log(f"       fact check: {c['status']:<13} \"{c['statement']}\"  ({c['evidence'][:110]})")
+            verdict_word = "only describes" if c["status"] == "supported" and c.get("only_describes") else c["status"]
+            log(f"       fact check: {verdict_word:<14} \"{c['statement']}\"  ({c['evidence'][:110]})")
         if fmt == "context" and not ok.get(verdict["context_before"]):
             fmt = "classic"
         elif fmt == "context" and verdict.get("context_after") and not ok.get(verdict["context_after"]):
