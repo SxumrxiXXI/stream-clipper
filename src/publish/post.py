@@ -111,6 +111,10 @@ def plan(cfg: dict, items: list[dict], now: dt.datetime | None = None) -> list[d
             if not item.get("style"):
                 styled = sum(1 for i in items if i.get("style"))
                 item["style"] = "long" if styled % 2 == 0 else "short"
+            if "ig_tags" not in item:
+                tagged = sum(1 for i in items if "ig_tags" in i)
+                h = yaml.safe_load((ROOT / "config" / "hashtags.yaml").read_text())
+                item["ig_tags"] = not (h.get("instagram_no_tags_test") and tagged % 2)
             taken.add(when.isoformat())
             placed.append(item)
         day += dt.timedelta(days=1)
@@ -118,15 +122,18 @@ def plan(cfg: dict, items: list[dict], now: dt.datetime | None = None) -> list[d
 
 
 def hashtags(item: dict, platform: str) -> list[str]:
-    """Game tags, then the streamer, then general tags, cut to the platform's count."""
+    """Game tags, then the streamer, cut to the platform's count (general tags only when
+    the game is unknown)."""
     h = yaml.safe_load((ROOT / "config" / "hashtags.yaml").read_text())
     game = item.get("game") or ""
     game_tags = h["games"].get(game) or (["#" + re.sub(r"\W+", "", game).lower()] if game else [])
     streamer = "#" + re.sub(r"\W+", "", item.get("streamer", "")).lower()
-    tags = [t for t in dict.fromkeys(game_tags[:2] + [streamer] + game_tags[2:] + h["general"])
+    if platform == "instagram" and item.get("ig_tags") is False:
+        return []                                      # the no-hashtag test arm
+    tags = [t for t in dict.fromkeys(game_tags[:2] + [streamer] + game_tags[2:] + ([] if game_tags else h["general"]))
             if len(t) > 1 and t not in h.get("banned", [])]
     tags = tags[: h["count"].get(platform, 3)]
-    if platform == "youtube":
+    if platform == "youtube" and h.get("youtube_shorts_tag", False):
         tags.append("#shorts")
     return tags
 
@@ -146,12 +153,17 @@ def caption(item: dict, platform: str) -> str:
         base = item["hook"].rstrip(".") + ("" if item["hook"].rstrip().endswith("?") else "")
     # Name the channel in words: a Twitch login is not always the same handle
     # on Instagram or X, and an @ there could tag a stranger.
-    credit = f"🎥 {item['streamer']} on Twitch"
+    # The streamer and the game are named in plain words on every platform: that
+    # is what search and the recommenders read, more than the hashtags.
+    game = item.get("game") or ""
+    credit = f"🎥 {item['streamer']} on Twitch · {game}" if game else f"🎥 {item['streamer']} on Twitch"
     tags = " ".join(hashtags(item, platform))
-    room = (270 if platform == "x" else 2000) - len(credit) - len(tags) - 4
+    # X ranks on replies far above likes, so its post carries the judge's question.
+    ask = item.get("question", "").strip() if platform == "x" else ""
+    room = (270 if platform == "x" else 2000) - len(credit) - len(tags) - len(ask) - 6
     if len(base) > room:
         base = base[: room - 1].rstrip() + "…"
-    return f"{base}\n{credit}\n{tags}"
+    return "\n".join(x for x in (base, ask, credit, tags) if x)
 
 
 def youtube_title(item: dict) -> str:
@@ -443,6 +455,13 @@ def stats(cfg: dict, items: list[dict]) -> None:
                 i.setdefault("urls", {})[platform] = row["post_url"]
         if views:
             i["views"] = views
+        # Keep the fuller numbers too (engaged views and view percentage on Shorts,
+        # reach, shares and watch time on Instagram): they say more than raw views.
+        for platform, row in _rows(res).items():
+            m = row.get("post_metrics") if isinstance(row.get("post_metrics"), dict) else {}
+            keep = {k: v for k, v in m.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            if keep:
+                i.setdefault("metrics", {})[platform] = keep
         print(f"{i['id']}  {sum(views.values()):>8,} views  {views}  {Path(i['video']).name[:50]}")
     save(items)
 
@@ -490,7 +509,9 @@ def report(items: list[dict]) -> None:
             print(f"{name[:22]:<22} {len(v):>5} {sum(v) / len(v):>10,.0f} {max(v):>8,}")
     table("moment type", lambda i: i.get("kind") or "not judged")
     table("judge rating", lambda i: (f"{i['judge']['overall']}/10" if i.get("judge") else "not judged"))
+    table("format", lambda i: i.get("format") or "classic")
     table("caption style", lambda i: i.get("style", "long"))
+    table("Instagram hashtags", lambda i: "none" if i.get("ig_tags") is False else "with tags")
     table("game", lambda i: i.get("game") or "?")
     table("streamer", lambda i: i.get("streamer") or "?")
     table("time slot", lambda i: dt.datetime.fromisoformat(i["scheduled_for"]).strftime("%H:%M"))

@@ -1,4 +1,4 @@
-# Half an hour after each posting slot: ask the posting service whether every
+# Half an hour after each posting slot (13:35 stays until the last 13:00 post is out): ask the posting service whether every
 # post that was due actually went out on every platform, and refresh the view
 # counts. If a post failed, this run fails, and GitHub emails the owner. Which
 # clip and which platform is written to the private repository, not here.
@@ -6,7 +6,7 @@ name: check
 
 on:
   schedule:
-    - cron: "35 11,16,20 * * *"     # 13:35, 18:35 and 22:35 in Cairo (winter time)
+    - cron: "35 1,11,16,20 * * *"   # 03:35, 13:35, 18:35 and 22:35 in Cairo (winter time)
   workflow_dispatch:
 
 permissions:

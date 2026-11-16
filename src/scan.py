@@ -175,7 +175,9 @@ def scan(a) -> None:
     rules = {"auto_approve": bool(posting.get("auto_approve")),
              "skip_channels": {str(c).lower() for c in posting.get("skip_channels") or []},
              "skip_title_words": [str(w).lower() for w in posting.get("skip_title_words") or []],
-             "max_per_streamer": int(posting.get("max_per_streamer") or 99)}
+             "max_per_streamer": int(posting.get("max_per_streamer") or 99),
+             "tournament_words": [str(w).lower() for w in posting.get("tournament_words") or []],
+             "max_tournament_clips": int(posting.get("max_tournament_clips", 99))}
     streamers = [s for s in streamers if str(s.get("twitch", "")).lower() not in rules["skip_channels"]]
     found = []
     t_scan = progress.report("Scanning streamers", 0, len(streamers), streamers[0]["name"], step_seconds=40)
@@ -308,12 +310,15 @@ def scan(a) -> None:
         v = m["verdict"]
         print(f"   {v['rank']:>5}  {m['streamer'][:16]:<16} {hms(m['burst_start'])}  [{v['moment_type']}]  {v['hook']}")
 
-    made, per = 0, defaultdict(int)
+    made, per, tournament = 0, defaultdict(int), 0
     for m, spec in order:
         if made >= want:
             break
         if per[m["streamer"]] >= rules["max_per_streamer"]:
             continue
+        feed = any(w in m["streamer"].lower() for w in rules["tournament_words"])
+        if feed and tournament >= rules["max_tournament_clips"]:
+            continue                       # enough from tournament broadcasts today
         label = f"{m['streamer']} at {hms(m['burst_start'])}"
         print(f"\n=== making clip {made + 1}/{want}: {label}", flush=True)
         progress.report("Finding the best moments", pool + made, total, f"making {label}", started_at=t0)
@@ -321,6 +326,7 @@ def scan(a) -> None:
         if rc == 0:
             made += 1
             per[m["streamer"]] += 1
+            tournament += 1 if feed else 0
         elif rc == 3:
             print("    turned down on a closer look; moving on to the next candidate")
         else:

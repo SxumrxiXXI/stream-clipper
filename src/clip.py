@@ -86,7 +86,7 @@ def ensure_backend() -> None:
     if backend_up():
         return
     log("OpenShorts is not running; starting it")
-    env = {**os.environ, "PATH": f"{DOCKER_BIN}:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")}
+    env = docker_env()
     if subprocess.run(["docker", "info"], env=env, capture_output=True).returncode != 0:
         if sys.platform != "darwin":
             die("Docker is not running (try: sudo systemctl start docker)")
@@ -259,6 +259,93 @@ def preview(video: Path, name: str) -> None:
                     "-frames:v", "1", "-q:v", "5", str(out)], capture_output=True)
 
 
+def docker_env() -> dict:
+    return {**os.environ, "PATH": f"{DOCKER_BIN}:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")}
+
+
+def clip_time(t: float, parts: list[list[float]]) -> float:
+    """A time in the downloaded stretch -> seconds into the finished clip (which may
+    be two pieces with a gap cut out)."""
+    acc = 0.0
+    for a, b in parts:
+        if t <= b:
+            return acc + max(0.0, t - a)
+        acc += b - a
+    return acc
+
+
+def ass_time(t: float) -> str:
+    return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:05.2f}"
+
+
+def add_context(job_id: str, video_url: str, before: str, after: str, payoff: float, total: float) -> str:
+    """Burn the page's own context onto a finished clip and return the new video URL.
+
+    `before` (the stakes) is on screen from the start until the payoff, `after`
+    (what it led to) from the payoff to the end, in a second colour. This is the
+    part of the post that is ours and not the streamer's: the platforms no longer
+    count captions or a reframe as making a clip original, but they do count
+    on-video text that tells the viewer something the footage does not.
+
+    The text is drawn by ffmpeg inside the OpenShorts container, which has the
+    Anton font and libass on every machine the pipeline runs on.
+    """
+    name = urllib.parse.unquote(video_url.rsplit("/", 1)[-1])
+    src = OPENSHORTS_DIR / "output" / job_id / name
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=width,height", "-of", "csv=p=0", str(src)], capture_output=True, text=True)
+    try:
+        w, h = (int(x) for x in probe.stdout.strip().split(",")[:2])
+    except ValueError:
+        w, h = 1080, 1920
+    size, margin_v, margin_h, outline = round(h * 0.066), round(h * 0.11), round(w * 0.07), max(4, round(h * 0.004))
+
+    def esc(text: str) -> str:
+        return text.replace("\\", "").replace("{", "(").replace("}", ")").replace("\n", " ").strip()
+
+    def style(name: str, colour: str) -> str:
+        return (f"Style: {name},Anton,{size},{colour},{colour},&H00000000,&H96000000,-1,0,0,0,100,100,0,0,1,"
+                f"{outline},2,8,{margin_h},{margin_h},{margin_v},1")
+
+    payoff = min(max(payoff + 0.3, 2.5), max(2.5, total - 2.5)) if after else total
+    events = [f"Dialogue: 0,{ass_time(0)},{ass_time(payoff)},Before,,0,0,0,,{{\\fad(120,120)}}{esc(before)}"]
+    if after:
+        events.append(f"Dialogue: 0,{ass_time(payoff)},{ass_time(total + 5)},After,,0,0,0,,{{\\fad(150,0)}}{esc(after)}")
+    ass = "\n".join([
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {w}", f"PlayResY: {h}", "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+        "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
+        "MarginR, MarginV, Encoding",
+        style("Before", "&H00FFFFFF"), style("After", "&H0000E6FF"),      # white, then yellow (BGR)
+        "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        *events, ""])
+    sub = OPENSHORTS_DIR / "uploads" / f"ctx_{job_id}.ass"
+    sub.parent.mkdir(exist_ok=True)
+    sub.write_text(ass)
+    out_name = "context_" + name
+    cmd = ["docker", "compose", "exec", "-T", "backend", "ffmpeg", "-v", "error", "-y",
+           "-i", f"/app/output/{job_id}/{name}",
+           "-vf", f"ass=/app/uploads/{sub.name}:fontsdir=/app/fonts",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "copy",
+           "-movflags", "+faststart", f"/app/output/{job_id}/{out_name}"]
+    res = subprocess.run(cmd, cwd=OPENSHORTS_DIR, env=docker_env(), capture_output=True, text=True)
+    sub.unlink(missing_ok=True)
+    if res.returncode != 0:
+        die(f"could not draw the context lines: {res.stderr.strip()[-300:]}")
+    return f"/videos/{job_id}/{urllib.parse.quote(out_name)}"
+
+
+def transcript_of(job_id: str) -> list[dict]:
+    """Every spoken line of the job's transcript, as OpenShorts saved it."""
+    for f in (OPENSHORTS_DIR / "output" / job_id).glob("*_metadata.json"):
+        try:
+            return (json.loads(f.read_text()).get("transcript") or {}).get("segments") or []
+        except (OSError, ValueError):
+            pass
+    return []
+
+
 def spoken_lines(job_id: str) -> list[tuple[float, float, int]] | None:
     """(start, end, words) of every spoken line OpenShorts transcribed, in window
     seconds. None when the transcript could not be read at all."""
@@ -400,6 +487,9 @@ def main() -> None:
                                      "watched by the judge, which accepts or rejects it and sets the cut")
     ap.add_argument("--judge-only", action="store_true",
                     help="with --moment: only watch and judge it; the verdict is saved into the moment file")
+    ap.add_argument("--format", choices=["auto", "classic", "context"], default="auto",
+                    help="classic: a 2 s hook title. context: the judge's stakes line during the build-up "
+                         "and its result line after the payoff. auto: rotate, one classic in three")
     ap.add_argument("--start", type=float, help="only use the source from this second")
     ap.add_argument("--end", type=float, help="...to this second (needs --start)")
     args = ap.parse_args()
@@ -521,22 +611,60 @@ def main() -> None:
                    "video_title_for_youtube_short": verdict["youtube_title"],
                    "predicted_score": verdict["overall"] * 10})
 
+    # Which format this clip gets. The context format needs a stakes line from the
+    # judge; one clip in three stays classic so the two can be compared by views.
+    fmt = "classic"
+    if verdict and verdict.get("context_before") and args.format != "classic":
+        fmt = "context" if args.format == "context" or len(queue.load()) % 3 else "classic"
+    if fmt == "context":
+        # Nothing is printed on a clip unless a second look at the footage, with the
+        # exact transcript, backs it. A line that fails is dropped; if the opening
+        # line fails, the clip is made the classic way.
+        import judge
+        try:
+            lines_said = [(float(x["start"]), (x.get("text") or "").strip()) for x in transcript_of(job_id)]
+            checks = judge.verify(window, [verdict["context_before"], verdict.get("context_after", "")],
+                                  start=parts[0][0], end=parts[-1][1], transcript=lines_said,
+                                  streamer=args.streamer, game=args.game)
+        except Exception as e:
+            log(f"the context lines could not be checked ({str(e)[:120]}): making this clip the classic way")
+            checks, fmt = [], "classic"
+        ok = {c["statement"]: c["status"] == "supported" for c in checks}
+        for c in checks:
+            log(f"       fact check: {c['status']:<13} \"{c['statement']}\"  ({c['evidence'][:110]})")
+        if fmt == "context" and not ok.get(verdict["context_before"]):
+            fmt = "classic"
+        elif fmt == "context" and verdict.get("context_after") and not ok.get(verdict["context_after"]):
+            verdict["context_after"] = ""
+        verdict["fact_checks"] = checks
+    game = args.game if not verdict or verdict.get("game_label_ok", True) else ""
+    if game != args.game:
+        log(f"the judge says this is not {args.game}: leaving the game out of the tags and title")
+
     for i, c in enumerate(clips):
         hook = (c.get("viral_hook_text") or "").strip()
-        log(f"clip {i + 1}/{len(clips)}: burning hook and captions")
+        log(f"clip {i + 1}/{len(clips)}: burning {'captions and context' if fmt == 'context' else 'hook and captions'}")
         if solo:
             progress.report("Making clips", i + 1, len(clips) + 1, f"captions on clip {i + 1} of {len(clips)}",
                             started_at=started)
-        video_url = burn(job_id, i, hook, camp, key)
+        if fmt == "context":
+            video_url = burn(job_id, i, "", camp, key)
+            total = sum(b - a for a, b in parts)
+            video_url = add_context(job_id, video_url, verdict["context_before"], verdict.get("context_after", ""),
+                                    clip_time(verdict["payoff_at"], parts), total)
+            log(f"       before: {verdict['context_before']}  |  after: {verdict.get('context_after') or '-'}")
+        else:
+            video_url = burn(job_id, i, hook, camp, key)
         dest = out_dir / f"{i + 1} - {safe_name(hook or 'clip')}.mp4"
         download(video_url, dest)
         preview(dest, f"{out_dir.name}_{i + 1}")
 
-        known = [tag(x) for x in (args.game, args.streamer) if x]
+        known = [tag(x) for x in (game, args.streamer) if x]
         tt, tt_tags = split_caption(c.get("video_description_for_tiktok", ""), camp, args.credit, known)
         ig, ig_tags = split_caption(c.get("video_description_for_instagram", ""), camp, args.credit, known)
         queue.add({
-            "video": str(dest), "streamer": args.streamer or args.credit.lstrip("@"), "game": args.game,
+            "video": str(dest), "streamer": args.streamer or args.credit.lstrip("@"), "game": game,
+            "format": fmt,
             "hook": hook, "score": args.score or float(c.get("predicted_score") or 0),
             "seconds": round(float(c.get("end", 0)) - float(c.get("start", 0)), 1),
             "captions": {"tiktok": tt, "instagram": ig,
@@ -545,7 +673,10 @@ def main() -> None:
             "campaign": args.campaign,
             **({"kind": verdict["moment_type"], "what": verdict["what_happens"],
                 "judge": {k: verdict[k] for k in ("overall", "standalone", "opening", "payoff")},
-                "names_in_text": verdict["names_in_text"]} if verdict else {}),
+                "names_in_text": verdict["names_in_text"], "question": verdict.get("question", ""),
+                "context": [verdict.get("context_before", ""), verdict.get("context_after", "")]
+                           if fmt == "context" else []}
+               if verdict else {}),
         })
         posts += [
             f"## {i + 1}. {hook or 'Clip'}",

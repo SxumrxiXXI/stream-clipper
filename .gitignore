@@ -28,3 +28,7 @@ tracker.csv
 
 # Local clone of the private settings-and-records repository
 private/
+
+# Research notes and reports (they mention the accounts and their numbers)
+research_notes/
+reports/

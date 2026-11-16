@@ -58,6 +58,12 @@ class Verdict(BaseModel):
     caption: str
     youtube_title: str
     names_in_text: list[str]
+    # What the page adds to the footage (see "6." in the prompt). Empty when
+    # nothing true can be said beyond what the picture already shows.
+    context_before: str
+    context_after: str
+    question: str               # one real question about the moment, for platforms built on replies
+    game_label_ok: bool         # does the game named above match what is on screen?
 
 
 PROMPT = """You are the editor of a short-form clips page for live-stream moments. You are given a video
@@ -96,7 +102,8 @@ Watch and listen to the whole video, then decide.
    with knowledge of what happened earlier. Be strict. Most stretches are not clips.
 
 2. start and end, as MM:SS in THIS video, for the best single clip between {min_s} and {max_s}
-   seconds long. The clip must contain the thing chat reacted to, which happened shortly
+   seconds long. Aim for 11 to 20 seconds when the moment fits in that; go up to {max_s}
+   only when the setup or the reaction truly needs it. The clip must contain the thing chat reacted to, which happened shortly
    before {burst}:
    - Start where the setup begins, at the start of a sentence or action, never mid-word.
      Do not start earlier than needed: every second before the moment must earn its place.
@@ -130,6 +137,32 @@ Watch and listen to the whole video, then decide.
 5. what_happens: one or two plain sentences describing only what is seen and heard.
    problems: anything that weakens the clip (empty list if none).
    moment_type: one of funny, clutch, fail, rage, shock, wholesome, hot_take, story, none.
+
+6. Context the page adds. This is what makes the post more than a copy of the footage, so
+   it must tell the viewer something they could NOT get from simply watching the clip.
+   Never describe what is visibly happening ("he shoots three players"): that adds nothing.
+   Good context is a fact from the scoreboard, the casters, the streamer's own words, the
+   stream title or the earlier part of this video: the score or the stakes, what the player
+   had left, what was on the line, what a rule, item or ability means, who the person is,
+   or what the result changed.
+   - context_before: at most 9 words. The situation or stakes going INTO the moment, shown
+     on screen from the start of your cut until payoff_at. It replaces the hook, so it must
+     also make the viewer want the outcome and must not give the outcome away.
+     Examples of the kind of line (never reuse their wording): "Down 0-2, one life left,
+     no healing", "His first ranked game after a two-year break".
+   - context_after: at most 9 words. What the moment led to or why it mattered, shown from
+     payoff_at to the end: the new score, what it won or cost, a record, the consequence.
+     Examples of the kind (never reuse their wording): "That kill forced overtime",
+     "It cost him the whole run: 3 hours gone".
+   - Every word must be true and checkable in this video or the context given above. No
+     invented numbers, scores, names or records. If you cannot state such a fact, return
+     an empty string for that line; an empty line is far better than a guess.
+   - question: one genuine question about this moment that viewers would disagree on, at
+     most 90 characters ("Right call to push with 12 seconds left?"). Not "thoughts?",
+     not "who did it better?", nothing that just asks for likes, comments or follows.
+     Empty string if there is no real question.
+   - game_label_ok: true if the game or category named above is what is actually on screen;
+     false if a different game or activity is being shown.
 """
 
 
@@ -229,6 +262,11 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
         while words and words[-1].lower().strip(".,:") in DANGLING:
             words.pop()
     v["hook"] = " ".join(words).strip()
+    for k, limit in (("context_before", 11), ("context_after", 11)):
+        w = str(v.get(k) or "").strip().strip('"').split()
+        v[k] = " ".join(w) if len(w) <= limit else ""      # an over-long line is dropped, not chopped
+    v["question"] = str(v.get("question") or "").strip()[:110]
+    v["game_label_ok"] = bool(v.get("game_label_ok", True))
     # The yes/no facts gate the clip; the scores only rank what passes.
     reasons = []
     if not v["has_clear_moment"] or v["moment_type"] == "none":
@@ -254,6 +292,85 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
     v["cost_usd"] = round(tokens_in * 0.25e-6 + tokens_out * 1.5e-6, 5)
     v["model"] = model
     return v
+
+
+class Check(BaseModel):
+    statement: str
+    status: str                 # supported | contradicted | unverifiable
+    evidence: str               # what was seen or heard, with its MM:SS
+
+
+class Checks(BaseModel):
+    checks: list[Check]
+
+
+CHECK_PROMPT = """You are a fact-checker for a clips page. An editor wants to print the statements
+below ON SCREEN over the part of this video from {start} to {end} (MM:SS). A wrong statement
+would be published under the page's name, so be strict.
+
+What you may rely on: the video itself (scoreboard, kill feed, name tags, on-screen text),
+what people in it say, and this transcript of the speech, "MM:SS text":
+{transcript}
+
+Known for certain: channel {streamer}; game or category {game}.
+
+For each statement decide:
+- supported: you can point to the exact evidence (what is shown or said, and when). Names of
+  people and teams, scores and numbers must match the evidence exactly, and the statement
+  must be about the player, team or person the clip actually shows.
+- contradicted: the video or transcript shows otherwise.
+- unverifiable: it may be true, but you cannot point to evidence for every part of it.
+Guessing "supported" is the one mistake that matters. When in doubt, answer unverifiable.
+
+Statements:
+{statements}
+"""
+
+
+def verify(video: Path, statements: list[str], *, start: float, end: float,
+           transcript: list[tuple[float, str]], streamer: str = "", game: str = "") -> list[dict]:
+    """A second, narrower look: are these on-screen statements backed by the video?
+
+    Returns one {statement, status, evidence} per statement, in order. Raises on
+    API errors; the caller then prints nothing it could not check.
+    """
+    statements = [x for x in statements if x]
+    if not statements:
+        return []
+    key, model = api_key()
+    client = genai.Client(api_key=key)
+    with open(video, "rb") as fh:
+        up = client.files.upload(file=fh, config={"mime_type": "video/mp4", "display_name": video.name})
+    try:
+        deadline = time.time() + 180
+        while True:
+            state = str(getattr(getattr(client.files.get(name=up.name), "state", ""), "name", "")).upper()
+            if state == "ACTIVE":
+                break
+            if state == "FAILED" or time.time() > deadline:
+                raise RuntimeError(f"Gemini could not process the video ({state or 'timeout'})")
+            time.sleep(2)
+        prompt = CHECK_PROMPT.format(
+            start=mmss(start), end=mmss(end), streamer=streamer or "unknown", game=game or "unknown",
+            transcript="\n".join(f"  {mmss(t)} {text}" for t, text in transcript) or "  (no speech)",
+            statements="\n".join(f"{n}. {x}" for n, x in enumerate(statements, 1)))
+        resp = client.models.generate_content(
+            model=model, contents=[up, prompt],
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Checks,
+                                               temperature=0))
+        got = json.loads(resp.text).get("checks") or []
+    finally:
+        try:
+            client.files.delete(name=up.name)
+        except Exception:
+            pass
+    out = []
+    for n, x in enumerate(statements):
+        c = got[n] if n < len(got) else {}
+        status = str(c.get("status", "")).lower().strip()
+        out.append({"statement": x, "status": status if status in ("supported", "contradicted") else "unverifiable",
+                    "evidence": str(c.get("evidence", ""))[:200]})
+    return out
 
 
 def main() -> None:
