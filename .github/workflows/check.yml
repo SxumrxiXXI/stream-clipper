@@ -1,0 +1,92 @@
+# Half an hour after each posting slot: ask the posting service whether every
+# post that was due actually went out on every platform, and refresh the view
+# counts. If a post failed, this run fails, and GitHub emails the owner. Which
+# clip and which platform is written to the private repository, not here.
+name: check
+
+on:
+  schedule:
+    - cron: "35 11,16,20 * * *"     # 13:35, 18:35 and 22:35 in Cairo (winter time)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write        # only to re-enable this workflow's own schedule (last step)
+
+# Shares the daily run's group, so the two never write the records at once.
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+env:
+  TZ: Africa/Cairo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Private settings and records
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}-private
+          ssh-key: ${{ secrets.STATE_DEPLOY_KEY }}
+          path: private
+
+      - name: Link them into place
+        run: |
+          ln -s private/config config
+          ln -s private/data data
+          mkdir -p data/logs
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Tools and key
+        env:
+          UPLOAD_POST_API_KEY: ${{ secrets.UPLOAD_POST_API_KEY }}
+        run: |
+          pip install -q pyyaml upload-post
+          umask 077
+          printf 'UPLOAD_POST_API_KEY=%s\n' "$UPLOAD_POST_API_KEY" > .env
+
+      - name: Did the posts go out
+        id: posts
+        run: |
+          log="data/logs/checks-$(date +%F).log"
+          echo "===== check $(date '+%F %H:%M') =====" >> "$log"
+          rc=0
+          python src/publish/post.py check >> "$log" 2>&1 || rc=$?
+          python src/publish/post.py stats >> "$log" 2>&1 || true
+          grep '^checked ' "$log" | tail -1 || true
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Save the records
+        if: always()
+        run: |
+          cd private
+          git config user.name "stream-clipper check"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "nothing new to save"; exit 0; fi
+          git commit -q -m "Post check $(date '+%F %H:%M')"
+          git pull -q --rebase origin main
+          git push -q origin HEAD:main 2> /dev/null
+          echo "records saved to the private repository"
+
+      - name: Keep the schedule alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable check.yml -R "$GITHUB_REPOSITORY" || true
+
+      - name: Report
+        run: |
+          if [ "${{ steps.posts.outputs.rc }}" != "0" ]; then
+            echo "A post did not go out as planned. The details are in the private repository's log."
+            exit 1
+          fi
+          echo "every post that was due went out"

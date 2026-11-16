@@ -105,6 +105,8 @@ def main() -> None:
         if cfg.get("auto_post"):
             if step(log, "4/5 send to the platforms", [PY, post, "send"]):
                 failed.append("send")
+            if step(log, "did earlier posts go out", [PY, post, "check"]):
+                failed.append("posts")
             step(log, "5/5 views so far", [PY, post, "stats"])
             step(log, "what is working", [PY, post, "report"])
             step(log, "followers", [PY, post, "growth"])

@@ -195,12 +195,13 @@ def upload_args(cfg: dict, item: dict) -> dict:
     return args
 
 
-def send(cfg: dict, items: list[dict], really: bool, verbose: bool = False) -> None:
+def send(cfg: dict, items: list[dict], really: bool, verbose: bool = False) -> int:
+    """Hand the planned clips to Upload-Post. Returns how many could not be handed over."""
     todo = [i for i in items if i["status"] == "ready" and i["scheduled_for"] and not i.get("_held")]
     todo.sort(key=lambda i: i["scheduled_for"])
     if not todo:
         print("nothing to send (run `post.py plan` first, or the queue is empty)")
-        return
+        return 0
     if really and not cfg.get("profile"):
         sys.exit("error: set `profile` in config/posting.yaml to your Upload-Post profile name")
     if really and "facebook" in cfg["platforms"] and not cfg.get("facebook_page_id"):
@@ -234,6 +235,7 @@ def send(cfg: dict, items: list[dict], really: bool, verbose: bool = False) -> N
         save(items)
     if not really:
         print("\nNothing was sent. Set auto_post: true in config/posting.yaml, or add --yes for this run.")
+    return sum(1 for i in todo if i["status"] == "failed")
 
 
 def post_now(cfg: dict, items: list[dict], ids: list[str]) -> None:
@@ -334,16 +336,96 @@ def _rows(res) -> dict[str, dict]:
     return found
 
 
+GRACE_MINUTES = 20        # how long after its slot a post may still be on its way
+
+
+def outcome(res: dict, minutes_late: float) -> tuple[str, dict]:
+    """Read Upload-Post's answer about one upload.
+
+    Returns (state, per-platform results). state is `ok` (live everywhere),
+    `partial` (live on some platforms, failed on others), `failed` (live
+    nowhere), `late` (still not published well after its slot) or `wait`.
+    """
+    rows = {}
+    for r in res.get("results") or []:
+        if r.get("platform"):
+            rows[r["platform"]] = {
+                "ok": bool(r.get("success")),
+                "url": r.get("post_url") or r.get("url") or "",
+                "error": str(r.get("error_message") or r.get("error") or r.get("message") or "")[:200]}
+    total = int(res.get("total") or len(rows) or 0)
+    finished = (str(res.get("status", "")).lower() in ("completed", "finished", "failed", "error")
+                or (total and int(res.get("completed") or 0) >= total))
+    if not finished:
+        return ("late" if minutes_late > 90 else "wait"), rows
+    good = [p for p, r in rows.items() if r["ok"]]
+    if rows and len(good) == len(rows):
+        return "ok", rows
+    return ("partial" if good else "failed"), rows
+
+
+def check(cfg: dict, items: list[dict]) -> int:
+    """Ask Upload-Post how every post whose slot has passed actually went.
+
+    A clip is marked posted only when at least one platform confirms it. Each
+    problem is reported once. Returns how many new problems were found, so the
+    caller can fail loudly (the daily run and the after-slot check both do).
+    """
+    api = client()
+    now = dt.datetime.now(dt.timezone.utc)
+    checked = problems = 0
+    for i in items:
+        if i["status"] not in ("scheduled", "posted") or not i.get("request_id") or not i.get("scheduled_for"):
+            continue
+        if i.get("checked") in ("ok", "partial"):
+            continue                                   # settled on an earlier check
+        late = (now - dt.datetime.fromisoformat(i["scheduled_for"])).total_seconds() / 60
+        if late < GRACE_MINUTES:
+            continue
+        try:
+            res = api.get_status(i["request_id"])
+        except Exception as e:                         # a hiccup on their side is not a failed post
+            print(f"{i['id']}: could not ask Upload-Post ({str(e)[:120]})")
+            continue
+        state, rows = outcome(res, late)
+        checked += 1
+        if state == "wait":
+            continue
+        new = i.get("checked") != state                # say it once, not at every check
+        i["checked"], i["results"] = state, rows
+        for plat, r in rows.items():
+            if r["url"]:
+                i.setdefault("urls", {})[plat] = r["url"]
+        when = dt.datetime.fromisoformat(i["scheduled_for"]).strftime("%a %d %b %H:%M")
+        if state == "ok":
+            i["status"] = "posted"
+            print(f"{i['id']}  {when}  live on {', '.join(sorted(rows))}")
+            continue
+        bad = {p: r["error"] or "no reason given" for p, r in rows.items() if not r["ok"]}
+        if state == "partial":
+            i["status"] = "posted"
+            print(f"{i['id']}  {when}  PROBLEM: failed on {', '.join(sorted(bad))}; live on the rest")
+        elif state == "failed":
+            i["status"], i["error"] = "failed", "; ".join(f"{p}: {e}" for p, e in bad.items())[:300]
+            print(f"{i['id']}  {when}  PROBLEM: did not go out on any platform")
+        else:
+            print(f"{i['id']}  {when}  PROBLEM: still not published {late:.0f} minutes after its slot")
+        for plat, err in bad.items():
+            print(f"        {plat}: {err}")
+        problems += 1 if new else 0
+    save(items)
+    print(f"checked {checked} posts: {problems} with new problems")
+    return problems
+
+
 def stats(cfg: dict, items: list[dict]) -> None:
     api = client()
     raw_dir = ROOT / "data" / "stats_raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
     now = dt.datetime.now(dt.timezone.utc)
     for i in items:
-        if i["status"] not in ("scheduled", "posted") or not i["request_id"]:
-            continue
-        if dt.datetime.fromisoformat(i["scheduled_for"]) > now:
-            continue                                   # not published yet
+        if i["status"] != "posted" or not i["request_id"]:
+            continue                                   # `check` decides what counts as posted
         try:
             res = api.get_post_analytics(i["request_id"])
         except Exception as e:
@@ -359,7 +441,6 @@ def stats(cfg: dict, items: list[dict]) -> None:
                     break
             if row.get("post_url"):
                 i.setdefault("urls", {})[platform] = row["post_url"]
-        i["status"] = "posted"
         if views:
             i["views"] = views
         print(f"{i['id']}  {sum(views.values()):>8,} views  {views}  {Path(i['video']).name[:50]}")
@@ -451,6 +532,7 @@ def main() -> None:
     k.add_argument("ids", nargs="+")
     k = sub.add_parser("skip")
     k.add_argument("id")
+    sub.add_parser("check", help="confirm that every post whose slot has passed went out")
     sub.add_parser("stats")
     sub.add_parser("report")
     sub.add_parser("growth")
@@ -470,7 +552,8 @@ def main() -> None:
                 sys.exit(f"error: no clip with id {a.only}")
             for i in items:          # hold the others back for this run only
                 i["_held"] = i["id"] != a.only
-        send(cfg, items, really=bool(cfg.get("auto_post")) or a.yes, verbose=a.verbose)
+        if send(cfg, items, really=bool(cfg.get("auto_post")) or a.yes, verbose=a.verbose):
+            sys.exit(1)          # at least one clip could not be handed to Upload-Post
     elif a.cmd == "now":
         post_now(cfg, items, a.ids)
     elif a.cmd == "resend":
@@ -489,6 +572,9 @@ def main() -> None:
         hit[0]["status"], hit[0]["scheduled_for"] = "skipped", None
         save(items)
         print(f"skipped {a.id}; run `post.py plan` to fill its slot")
+    elif a.cmd == "check":
+        if check(cfg, items):
+            sys.exit(1)
     elif a.cmd == "stats":
         stats(cfg, items)
     elif a.cmd == "report":
