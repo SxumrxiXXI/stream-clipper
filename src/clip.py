@@ -259,19 +259,21 @@ def preview(video: Path, name: str) -> None:
                     "-frames:v", "1", "-q:v", "5", str(out)], capture_output=True)
 
 
-def spoken_lines(job_id: str) -> list[tuple[float, float, int]]:
-    """(start, end, words) of every spoken line OpenShorts transcribed, in window seconds."""
-    out = []
+def spoken_lines(job_id: str) -> list[tuple[float, float, int]] | None:
+    """(start, end, words) of every spoken line OpenShorts transcribed, in window
+    seconds. None when the transcript could not be read at all."""
+    out, found = [], False
     for f in (ROOT / "vendor" / "openshorts" / "output" / job_id).glob("*_metadata.json"):
         try:
             segs = (json.loads(f.read_text()).get("transcript") or {}).get("segments") or []
         except (OSError, ValueError):
             continue
+        found = True
         for s in segs:
             n = len((s.get("text") or "").split())
             if n:
                 out.append((float(s["start"]), float(s["end"]), n))
-    return sorted(out)
+    return sorted(out) if found else None
 
 
 def fit_to_speech(start: float, end: float, lines: list[tuple[float, float, int]], limit: float,
@@ -480,13 +482,30 @@ def main() -> None:
         # One clip, cut exactly where the judge put the moment, with the judge's text.
         clips = clips[:1]
         c0 = clips[0]
+        # A little air after the judged end; both ends are later snapped to word
+        # boundaries so the clip never stops in the middle of a word.
+        tail = min(args.end - args.start, verdict["end"] + 1.5)
+        lines = spoken_lines(job_id)
+        parts = fit_to_speech(verdict["start"], tail, lines or [], args.end - args.start,
+                              float(camp["clip"]["max_seconds"]))
+        if lines is not None and not any(a <= (s + e) / 2 <= b for s, e, _ in lines for a, b in parts):
+            # The judge heard a reaction that the transcript does not contain. A
+            # cut in which nobody says a word, with nothing said right after it
+            # either, has been a dull clip every time, so it is turned down here
+            # and remembered, and scan.py moves on to the next candidate.
+            log("nobody speaks in this cut or right after it: turned down")
+            with open(ROOT / "data" / "judged.jsonl", "a") as f:
+                f.write(json.dumps({
+                    "at": dt.datetime.now().isoformat(timespec="seconds"), "source": args.source,
+                    "streamer": args.streamer, "start": args.start, "end": args.end, "keep": False,
+                    "rejected_because": ["no speech in or right after the cut"],
+                    "what_happens": verdict.get("what_happens", ""), "hook": verdict.get("hook", ""),
+                }, ensure_ascii=False) + "\n")
+            if window:
+                window.unlink(missing_ok=True)
+            sys.exit(3)
         if abs(float(c0.get("start", 0)) - verdict["start"]) > 1 or abs(float(c0.get("end", 0)) - verdict["end"]) > 1:
             log(f"re-cutting to the judged moment: {verdict['start']:.1f}-{verdict['end']:.1f} s of the window")
-            # A little air after the judged end, then snap both ends to word
-            # boundaries so the clip never stops in the middle of a word.
-            tail = min(args.end - args.start, verdict["end"] + 1.5)
-            parts = fit_to_speech(verdict["start"], tail, spoken_lines(job_id), args.end - args.start,
-                                  float(camp["clip"]["max_seconds"]))
             if len(parts) > 1:
                 log(f"the reaction comes after a silence: keeping {parts[0][0]:.1f}-{parts[0][1]:.1f} s "
                     f"and {parts[1][0]:.1f}-{parts[1][1]:.1f} s")

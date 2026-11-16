@@ -23,6 +23,11 @@ on:
       state_branch:
         description: "Branch of the private repository to save the records to"
         default: "main"
+      simulate:
+        description: "Fault to rehearse (only with dry_run)"
+        type: choice
+        options: ["none", "bad_gemini_key"]
+        default: "none"
 
 permissions:
   contents: read
@@ -87,8 +92,13 @@ jobs:
           UPLOAD_POST_API_KEY: ${{ secrets.UPLOAD_POST_API_KEY }}
           TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
           TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+          SIMULATE: ${{ inputs.dry_run && inputs.simulate || 'none' }}
         run: |
           umask 077
+          if [ "$SIMULATE" = bad_gemini_key ]; then
+            echo "rehearsal: running with a Gemini key that does not work"
+            GEMINI_API_KEY="not-a-real-key-rehearsal"
+          fi
           printf 'GEMINI_API_KEY=%s\nUPLOAD_POST_API_KEY=%s\nTWITCH_CLIENT_ID=%s\nTWITCH_CLIENT_SECRET=%s\n' \
             "$GEMINI_API_KEY" "$UPLOAD_POST_API_KEY" "$TWITCH_CLIENT_ID" "$TWITCH_CLIENT_SECRET" > .env
           test -n "$GEMINI_API_KEY" || { echo "the keys are not set in this repository's secrets"; exit 1; }

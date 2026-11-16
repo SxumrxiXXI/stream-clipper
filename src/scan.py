@@ -321,6 +321,8 @@ def scan(a) -> None:
         if rc == 0:
             made += 1
             per[m["streamer"]] += 1
+        elif rc == 3:
+            print("    turned down on a closer look; moving on to the next candidate")
         else:
             print(f"    clip.py failed (exit {rc}); moving on")
     # Stretches downloaded for candidates that were not used.
@@ -329,6 +331,11 @@ def scan(a) -> None:
     print(f"\nmade {made} of {want} clips (judged {looked} candidates, {len(kept)} passed)")
     progress.report("Finding the best moments", total, total, f"{made} clips made from {looked} candidates",
                     started_at=t0, finished=True)
+    if looked and not made:
+        # Candidates existed and not one clip came out: something is broken (a
+        # key, the clipper), not just a quiet day. Fail loudly so the run is
+        # marked failed and its owner hears about it.
+        sys.exit("error: there were candidates but no clip could be made")
 
 
 AUTO_LIST = ROOT / "config" / "watchlist.auto.yaml"
