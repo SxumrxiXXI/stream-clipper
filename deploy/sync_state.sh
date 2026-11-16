@@ -7,6 +7,7 @@ set -euo pipefail
 cd "${0:A:h}/.."
 login=$(gh api user --jq .login)
 [ -d private/.git ] || gh repo clone "$login/stream-clipper-private" private -- -q
+cp CLAUDE.md private/CLAUDE.md          # the project brief is backed up with the records
 git -C private add -A
 if ! git -C private diff --cached --quiet; then
   git -C private -c user.name="$login" -c user.email="$(gh api user --jq .id)+$login@users.noreply.github.com" \

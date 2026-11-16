@@ -114,7 +114,10 @@ def ensure_backend() -> None:
     die("OpenShorts did not become ready within 3 minutes")
 
 
-def api_json(method: str, path: str, body: dict | None = None, key: str | None = None) -> dict:
+def api_json(method: str, path: str, body: dict | None = None, key: str | None = None,
+             allow: str | None = None) -> dict | None:
+    """Call OpenShorts. An error stops the run, except one whose text contains
+    `allow`, which returns None so the caller can carry on without that step."""
     headers = {}
     data = None
     if body is not None:
@@ -127,7 +130,10 @@ def api_json(method: str, path: str, body: dict | None = None, key: str | None =
         with urllib.request.urlopen(req, timeout=900) as r:
             return json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
-        die(f"{method} {path} -> HTTP {e.code}: {e.read()[:500].decode('utf-8', 'replace')}")
+        text = e.read()[:500].decode("utf-8", "replace")
+        if allow and allow in text:
+            return None
+        die(f"{method} {path} -> HTTP {e.code}: {text}")
 
 
 def submit(source: str, is_file: bool, camp: dict, n_clips: int, key: str,
@@ -325,7 +331,14 @@ def burn(job_id: str, index: int, hook_text: str, camp: dict, key: str) -> str:
     }
     if filename:
         body["input_filename"] = urllib.parse.unquote(filename)
-    res = api_json("POST", "/api/subtitle", body, key)
+    res = api_json("POST", "/api/subtitle", body, key, allow="No words found")
+    if res is None:
+        # Nobody speaks in this cut (pure gameplay with crowd or game sound).
+        # The clip is still good: keep the hook and go without captions.
+        log("no speech in this cut: keeping the clip without captions")
+        if not filename:
+            die("this cut has no speech and no hook, so there is nothing to burn onto it")
+        return f"/videos/{job_id}/{filename}"
     return res["new_video_url"]
 
 
