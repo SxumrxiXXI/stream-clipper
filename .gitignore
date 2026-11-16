@@ -21,6 +21,8 @@ tools/
 # These live outside this public repository.
 CLAUDE.md
 config/
+/config
+/data
 tracker.csv
 *.command
 

@@ -5,9 +5,8 @@
 name: daily
 
 on:
-  # Started by hand until the hand-over from the owner's machine is done. Then:
-  # schedule:
-  #   - cron: "17 7 * * *"        # 09:17 in Cairo (winter time)
+  schedule:
+    - cron: "17 7 * * *"          # 09:17 in Cairo (winter time)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -118,7 +117,13 @@ jobs:
           git add -A
           if git diff --cached --quiet; then echo "nothing new to save"; exit 0; fi
           git commit -q -m "Daily run $(date +%F)"
-          git push -q --force origin "HEAD:refs/heads/${STATE_BRANCH}" 2> /dev/null
+          if [ "$STATE_BRANCH" = main ]; then
+            # Keep anything the owner pushed while this run was going.
+            git pull -q --rebase origin main
+            git push -q origin HEAD:main 2> /dev/null
+          else
+            git push -q --force origin "HEAD:refs/heads/${STATE_BRANCH}" 2> /dev/null
+          fi
           echo "records saved to the private repository (${STATE_BRANCH})"
 
       # GitHub switches a schedule off after 60 days without activity in the
