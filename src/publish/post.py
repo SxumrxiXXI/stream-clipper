@@ -82,6 +82,109 @@ def client():
 
 
 # --------------------------------------------------------------------------- #
+def by_streamer(ready: list[dict]) -> list[dict]:
+    """Round-robin across streamers, best score first within each."""
+    by: dict[str, list] = {}
+    for i in sorted(ready, key=lambda i: -float(i.get("score") or 0)):
+        by.setdefault(i.get("streamer", ""), []).append(i)
+    out = []
+    while any(by.values()):
+        for name in list(by):
+            if by[name]:
+                out.append(by[name].pop(0))
+    return out
+
+
+def dress(item: dict, items: list[dict]) -> None:
+    """Give a newly placed clip its caption style and its Instagram hashtag arm."""
+    if not item.get("style"):
+        styled = sum(1 for i in items if i.get("style"))
+        item["style"] = "long" if styled % 2 == 0 else "short"
+    if "ig_tags" not in item:
+        tagged = sum(1 for i in items if "ig_tags" in i)
+        h = yaml.safe_load((ROOT / "config" / "hashtags.yaml").read_text())
+        item["ig_tags"] = not (h.get("instagram_no_tags_test") and tagged % 2)
+
+
+def plan_fresh(cfg: dict, items: list[dict], now: dt.datetime) -> tuple[list[dict], list[tuple]]:
+    """Today's clips go out today.
+
+    The clips made in this run take the next day's worth of slots. Clips from
+    earlier days that are still waiting become a reserve: the best of them fill
+    any slot today's run could not, the rest move behind, and one that could not
+    go out within `reserve_days` of being made is withdrawn. Returns the newly
+    placed clips and the changes to make to posts already at Upload-Post, as
+    ("move", clip, new_time) or ("withdraw", clip, None).
+    """
+    tz = ZoneInfo(cfg["timezone"])
+    soon = now + dt.timedelta(minutes=30)
+    times = sorted(dt.time.fromisoformat(x) for x in cfg["slots"])
+    slots, day = [], now.date()
+    while len(slots) < len(times) * 12:
+        slots += [w for w in (dt.datetime.combine(day, t, tz) for t in times) if w >= soon]
+        day += dt.timedelta(days=1)
+    keep_days = float(cfg.get("reserve_days", 3))
+
+    fresh = by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"]])
+    reserve = [i for i in items if i["status"] == "scheduled" and i.get("scheduled_for")
+               and dt.datetime.fromisoformat(i["scheduled_for"]) > soon]
+    reserve.sort(key=lambda i: ((i.get("judge") or {}).get("overall", 0), float(i.get("score") or 0)), reverse=True)
+
+    placed, changes = [], []
+    today, later = slots[:len(times)], slots[len(times):]
+    for item in fresh[:len(today)]:
+        item["scheduled_for"] = today.pop(0).isoformat()
+        dress(item, items)
+        placed.append(item)
+    free = today + later                      # gaps left in today's slots come first
+    for item in fresh[len(times):] + reserve:
+        made = dt.datetime.fromisoformat(item["created"])
+        made = made if made.tzinfo else made.replace(tzinfo=tz)
+        when = free[0]
+        if when > made + dt.timedelta(days=keep_days):
+            if item["status"] == "scheduled":
+                changes.append(("withdraw", item, None))
+            else:
+                item["status"], item["note"] = "skipped", "more clips than slots on the day it was made"
+            continue
+        free.pop(0)
+        if item["status"] == "scheduled":
+            if dt.datetime.fromisoformat(item["scheduled_for"]) != when:
+                changes.append(("move", item, when))
+        else:
+            item["scheduled_for"] = when.isoformat()
+            dress(item, items)
+            placed.append(item)
+    return placed, changes
+
+
+def apply_changes(cfg: dict, items: list[dict], changes: list[tuple], really: bool) -> None:
+    """Carry out plan_fresh's moves and withdrawals at Upload-Post (or only print them)."""
+    api = client() if really and changes else None
+    for what, item, when in changes:
+        job = (item.get("response") or {}).get("job_id")
+        was = dt.datetime.fromisoformat(item["scheduled_for"]).strftime("%a %d %b %H:%M")
+        if what == "move":
+            print(f"{'MOVE' if really else 'would move'}  {item['id']}  {was} -> {when:%a %d %b %H:%M}")
+            if really and job:
+                try:
+                    api.edit_scheduled(job, scheduled_date=when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                       timezone=cfg["timezone"])
+                    item["scheduled_for"] = when.isoformat()
+                except Exception as e:
+                    print(f"      could not move it ({str(e)[:160]}); it stays at {was}")
+        else:
+            print(f"{'WITHDRAW' if really else 'would withdraw'}  {item['id']}  {was}  (newer clips took its place)")
+            if really and job:
+                try:
+                    api.cancel_scheduled(job)
+                    item["status"], item["scheduled_for"] = "skipped", None
+                    item["note"] = "withdrawn: newer clips took its place"
+                except Exception as e:
+                    print(f"      could not withdraw it ({str(e)[:160]}); it stays at {was}")
+        save(items)
+
+
 def plan(cfg: dict, items: list[dict], now: dt.datetime | None = None) -> list[dict]:
     """Give every ready clip the next free slot. Returns the clips it placed."""
     tz = ZoneInfo(cfg["timezone"])
@@ -564,7 +667,14 @@ def main() -> None:
     if a.cmd == "list":
         show(items)
     elif a.cmd == "plan":
-        placed = plan(cfg, items)
+        if cfg.get("fresh_first"):
+            now = dt.datetime.now(ZoneInfo(cfg["timezone"]))
+            placed, changes = plan_fresh(cfg, items, now)
+            save(items)
+            # Posts already at Upload-Post are only touched when posting is really on.
+            apply_changes(cfg, items, changes, really=bool(cfg.get("auto_post")))
+        else:
+            placed = plan(cfg, items)
         save(items)
         print(f"placed {len(placed)} clips")
         show(items)

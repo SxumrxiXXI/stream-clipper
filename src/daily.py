@@ -97,9 +97,11 @@ def main() -> None:
     with open(logs / f"daily-{dt.date.today()}.log", "a") as log:
         failed = []
         if not a.no_discover:
-            if step(log, "1/5 discover", [PY, "-u", scan, "discover", "--add", "10"]):
+            # Who is being clipped most in the last day, not the last week.
+            if step(log, "1/5 discover", [PY, "-u", scan, "discover", "--days", "1", "--add", "10"]):
                 failed.append("discover")
-        if step(log, "2/5 scan and make clips", [PY, "-u", scan, "--vods", "1", "--make", str(n)]):
+        # Only streams from the last two days (a stream that ran overnight counts as today's).
+        if step(log, "2/5 scan and make clips", [PY, "-u", scan, "--days", "2", "--vods", "1", "--make", str(n)]):
             failed.append("scan")
         step(log, "3/5 plan the queue", [PY, post, "plan"])
         if cfg.get("auto_post"):
