@@ -81,7 +81,9 @@ def main() -> None:
     except OSError:
         sys.exit("another daily run is in progress; not starting a second one")
     today_log = ROOT / "data" / "logs" / f"daily-{dt.date.today()}.log"
-    if not a.force and today_log.exists() and "daily run finished" in today_log.read_text():
+    # Only a clean finish counts: after a run that ended "with problems" the day
+    # can simply be started again.
+    if not a.force and today_log.exists() and "daily run finished" in today_log.read_text().splitlines():
         sys.exit("today's run already finished (use --force to run again)")
 
     cfg = yaml.safe_load((ROOT / "config" / "posting.yaml").read_text())
