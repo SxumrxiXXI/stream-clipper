@@ -27,6 +27,7 @@ on:
 
 permissions:
   contents: read
+  actions: write        # only to re-enable this workflow's own schedule (last step)
 
 concurrency:
   group: daily
@@ -117,5 +118,13 @@ jobs:
           git add -A
           if git diff --cached --quiet; then echo "nothing new to save"; exit 0; fi
           git commit -q -m "Daily run $(date +%F)"
-          git push -q --force origin "HEAD:refs/heads/${STATE_BRANCH}"
+          git push -q --force origin "HEAD:refs/heads/${STATE_BRANCH}" 2> /dev/null
           echo "records saved to the private repository (${STATE_BRANCH})"
+
+      # GitHub switches a schedule off after 60 days without activity in the
+      # repository. Re-enabling it on every run keeps the daily run alive.
+      - name: Keep the schedule alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable daily.yml -R "$GITHUB_REPOSITORY" || true

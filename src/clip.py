@@ -241,6 +241,18 @@ def wait(job_id: str) -> dict:
         time.sleep(8)
 
 
+def preview(video: Path, name: str) -> None:
+    """Save a strip of frames (one every 3 s) to data/previews/, small enough to keep.
+
+    The clip file itself may not outlive the run (a hosted runner is wiped), and
+    this is what lets someone check afterwards how it was framed and captioned.
+    """
+    out = ROOT / "data" / "previews" / f"{re.sub(r'[^A-Za-z0-9._-]+', '_', name)}.jpg"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-vf", "fps=1/3,scale=270:-1,tile=10x1",
+                    "-frames:v", "1", "-q:v", "5", str(out)], capture_output=True)
+
+
 def spoken_lines(job_id: str) -> list[tuple[float, float, int]]:
     """(start, end, words) of every spoken line OpenShorts transcribed, in window seconds."""
     out = []
@@ -486,6 +498,7 @@ def main() -> None:
         video_url = burn(job_id, i, hook, camp, key)
         dest = out_dir / f"{i + 1} - {safe_name(hook or 'clip')}.mp4"
         download(video_url, dest)
+        preview(dest, f"{out_dir.name}_{i + 1}")
 
         known = [tag(x) for x in (args.game, args.streamer) if x]
         tt, tt_tags = split_caption(c.get("video_description_for_tiktok", ""), camp, args.credit, known)

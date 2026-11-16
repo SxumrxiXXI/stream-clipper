@@ -89,6 +89,7 @@ def main() -> None:
     # 3. our own leftovers
     for sub, days, why in (("windows", 1, "downloaded stretch, over a day old"),
                            ("chat", 7, "chat log, over a week old"),
+                           ("previews", 14, "preview strip, over two weeks old"),
                            ("scan/candidates", 7, "scan candidate, over a week old")):
         d = ROOT / "data" / sub
         if d.is_dir():
