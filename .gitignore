@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Working data: audio, chat, clip windows, renders
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+vendor/
+clips/
+tools/
+
+# Private to the owner: the project brief, personal settings and records.
+# These live outside this public repository.
+CLAUDE.md
+config/
+tracker.csv
+*.command
