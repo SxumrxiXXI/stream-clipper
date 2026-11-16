@@ -6,7 +6,10 @@ name: check
 
 on:
   schedule:
-    - cron: "10 1,11,16,20 * * *"   # 03:10, 13:10, 18:10 and 22:10 in Cairo (winter time)
+    # GitHub's timer can skip a start, so this runs every hour and again at 40 past
+    # in the hours right after a slot. A run with nothing due ends in seconds.
+    - cron: "10 * * * *"
+    - cron: "40 1,16,20 * * *"      # 03:40, 18:40 and 22:40 in Cairo (winter time)
   workflow_dispatch:
 
 permissions:
@@ -66,7 +69,8 @@ jobs:
             grep '^checked ' "$log" | tail -1 | grep -q ', 0 still publishing' && break
             sleep 240
           done
-          python src/publish/post.py stats >> "$log" 2>&1 || true
+          # Views are refreshed four times a day, not on every hourly look.
+          case "$(date +%H)" in 03|13|18|22) python src/publish/post.py stats >> "$log" 2>&1 || true ;; esac
           grep '^checked ' "$log" | tail -1 || true
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
 

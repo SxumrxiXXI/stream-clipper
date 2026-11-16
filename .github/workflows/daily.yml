@@ -5,8 +5,14 @@
 name: daily
 
 on:
+  # GitHub's timer is best-effort: a start can be late or skipped outright. So
+  # there are three chances a day. The first one that runs does the work; a later
+  # one finds the day already done and stops in seconds. If the first one ended
+  # with problems, the next one tries again.
   schedule:
     - cron: "17 7 * * *"          # 09:17 in Cairo (winter time)
+    - cron: "47 8 * * *"          # 10:47
+    - cron: "17 10 * * *"         # 12:17
   workflow_dispatch:
     inputs:
       dry_run:
@@ -56,17 +62,30 @@ jobs:
           ssh-key: ${{ secrets.STATE_DEPLOY_KEY }}
           path: private
 
+      - name: Already done today?
+        id: guard
+        env:
+          FORCE: ${{ inputs.force && '1' || '' }}
+        run: |
+          if [ -z "$FORCE" ] && grep -qx "daily run finished" "private/data/logs/daily-$(date +%F).log" 2> /dev/null; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+            echo "today's run already finished; nothing to do"
+          fi
+
       - name: Link them into place
+        if: steps.guard.outputs.done != 'true'
         run: |
           ln -s private/config config
           ln -s private/data data
           mkdir -p data/logs
 
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.done != 'true'
         with:
           python-version: "3.11"
 
       - name: Tools
+        if: steps.guard.outputs.done != 'true'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg unzip > /dev/null
           pip install -q -r requirements.txt yt-dlp
@@ -76,6 +95,7 @@ jobs:
           unzip -q -o /tmp/tdl.zip TwitchDownloaderCLI -d tools && chmod +x tools/TwitchDownloaderCLI
 
       - name: OpenShorts
+        if: steps.guard.outputs.done != 'true'
         run: |
           git clone -q https://github.com/mutonby/openshorts.git vendor/openshorts
           git -C vendor/openshorts checkout -q "$OPENSHORTS_COMMIT"
@@ -87,6 +107,7 @@ jobs:
           docker compose up -d --no-build backend
 
       - name: Keys
+        if: steps.guard.outputs.done != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           UPLOAD_POST_API_KEY: ${{ secrets.UPLOAD_POST_API_KEY }}
@@ -104,6 +125,7 @@ jobs:
           test -n "$GEMINI_API_KEY" || { echo "the keys are not set in this repository's secrets"; exit 1; }
 
       - name: Daily run
+        if: steps.guard.outputs.done != 'true'
         env:
           CLIP_DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '' }}
           FORCE: ${{ inputs.force && '1' || '' }}
@@ -116,7 +138,7 @@ jobs:
           python src/daily.py "${args[@]}"
 
       - name: Save the records
-        if: always()
+        if: always() && steps.guard.outputs.done != 'true'
         env:
           STATE_BRANCH: ${{ inputs.state_branch || 'main' }}
         run: |
