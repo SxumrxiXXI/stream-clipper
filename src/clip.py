@@ -550,6 +550,7 @@ def main() -> None:
                 if not verdict:
                     sys.exit(4)             # the judge could not run
                 moment["verdict"] = verdict
+                moment["window"] = str(window)      # scan.py compares the kept candidates' footage
                 Path(args.moment).write_text(json.dumps(moment, ensure_ascii=False))
                 sys.exit(0)                 # the window stays on disk for the clip itself
         job_id = submit(str(window), True, camp, n, key)
@@ -668,6 +669,9 @@ def main() -> None:
         queue.add({
             "video": str(dest), "streamer": args.streamer or args.credit.lstrip("@"), "game": game,
             "format": fmt,
+            **({"found_by": ("viewer clip" if not moment.get("chatters") else
+                             "chat + viewer clip" if moment.get("viewer_clips") else "chat"),
+                "pick": moment.get("pick"), "compare": moment.get("compare")} if moment else {}),
             "hook": hook, "score": args.score or float(c.get("predicted_score") or 0),
             "seconds": round(float(c.get("end", 0)) - float(c.get("start", 0)), 1),
             "captions": {"tiktok": tt, "instagram": ig,

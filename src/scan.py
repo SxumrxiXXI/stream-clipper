@@ -161,8 +161,12 @@ def moments_for_vod(vod: dict, viewer_clips: list[dict], per_vod: int) -> list[d
                 "clips": [[c["offset"], c["title"], c["views"]]],
                 "score": round(10 * math.log10(1 + c["views"]), 1), "why": "viewers clipped it",
             })
-    out.sort(key=lambda m: m["score"], reverse=True)
-    return out[:per_vod]
+    # The strongest chat moments, plus the most-viewed clips viewers made while
+    # chat stayed calm. Those score low on the chat scale, so without their own
+    # places they would always be cut here and never be looked at.
+    by_chat = sorted((m for m in out if m["chatters"]), key=lambda m: m["score"], reverse=True)[:per_vod]
+    by_view = sorted((m for m in out if not m["chatters"]), key=lambda m: m["viewer_clip_views"], reverse=True)[:3]
+    return sorted(by_chat + by_view, key=lambda m: m["score"], reverse=True)
 
 
 def scan(a) -> None:
@@ -177,7 +181,10 @@ def scan(a) -> None:
              "skip_title_words": [str(w).lower() for w in posting.get("skip_title_words") or []],
              "max_per_streamer": int(posting.get("max_per_streamer") or 99),
              "tournament_words": [str(w).lower() for w in posting.get("tournament_words") or []],
-             "max_tournament_clips": int(posting.get("max_tournament_clips", 99))}
+             "max_tournament_clips": int(posting.get("max_tournament_clips", 99)),
+             "viewer_clip_every": int(posting.get("viewer_clip_every", 3)),
+             "viewer_clip_min_views": int(posting.get("viewer_clip_min_views", 300)),
+             "compare_runs": int(posting.get("compare_runs", 3))}
     streamers = [s for s in streamers if str(s.get("twitch", "")).lower() not in rules["skip_channels"]]
     found = []
     t_scan = progress.report("Scanning streamers", 0, len(streamers), streamers[0]["name"], step_seconds=40)
@@ -260,6 +267,24 @@ def scan(a) -> None:
         print("\nno new moments to look at (everything strong was already clipped or rejected)")
         return
 
+    # Chat is not the only witness. On ten streams chat bursts caught 37% of the
+    # moments viewers clipped (64% by clip views; study of 2026-11-16). So moments
+    # viewers clipped while chat stayed calm get every third place in the pool,
+    # biggest clip first, provided the clip has a real audience.
+    every = rules["viewer_clip_every"]
+    by_chat = [m for m in candidates if m.get("chatters")]
+    by_view = sorted((m for m in candidates if not m.get("chatters")
+                      and m.get("viewer_clip_views", 0) >= rules["viewer_clip_min_views"]),
+                     key=lambda m: -m["viewer_clip_views"])
+    if every > 1:
+        candidates = []
+        while by_chat or by_view:
+            candidates += [by_chat.pop(0) for _ in range(min(every - 1, len(by_chat)))]
+            if by_view:
+                candidates.append(by_view.pop(0))
+    else:
+        candidates = by_chat
+
     # Two passes. First the judge (moments/judge.py) watches more candidates
     # than we need; then clips are made from the ones it rated best. Taking the
     # best of a pool beats taking the first few that merely pass.
@@ -302,6 +327,30 @@ def scan(a) -> None:
 
     # Best first: the judge's rating, with the size of chat's reaction as tie-break.
     kept.sort(key=lambda ms: (ms[0]["verdict"]["rank"], ms[0]["score"]), reverse=True)
+    # The judge's own scores bunch at 8 and 9, so they barely order anything. The
+    # candidates it kept are therefore compared with each other, several times in
+    # different orders, and the average place decides. This only orders them: it
+    # never rejects one.
+    if len(kept) > want and rules["compare_runs"] > 0:
+        try:
+            import judge
+            entries = [{"id": str(spec), "video": Path(m["window"]), "streamer": m["streamer"],
+                        "game": m.get("game", "")} for m, spec in kept if m.get("window") and Path(m["window"]).exists()]
+            if len(entries) == len(kept):
+                table, cost = judge.compare(entries, runs=rules["compare_runs"])
+                for m, spec in kept:
+                    m["compare"] = {**table[str(spec)], "of": len(kept)}
+                kept.sort(key=lambda ms: (ms[0]["compare"]["mean"], -ms[0]["verdict"]["rank"]))
+                print(f"\ncompared {len(kept)} candidates with each other, {len(next(iter(table.values()))['ranks'])} "
+                      f"valid runs, ${cost:.3f}:")
+                for m, _ in kept:
+                    c = m["compare"]
+                    print(f"   avg place {c['mean']:>4.1f}  {str(c['ranks']):<14} {m['streamer'][:16]:<16} "
+                          f"{hms(m['burst_start'])}  {m['verdict']['hook'][:60]}")
+            else:
+                print("\nsome stretches are no longer on disk: keeping the judge's own order")
+        except Exception as e:
+            print(f"\nthe comparison could not run ({str(e)[:140]}): keeping the judge's own order")
     if not kept and unjudged:
         print("\nthe judge could not run; falling back to chat ranking with OpenShorts choosing the cuts")
     order = kept + unjudged
@@ -321,6 +370,8 @@ def scan(a) -> None:
             continue                       # enough from tournament broadcasts today
         label = f"{m['streamer']} at {hms(m['burst_start'])}"
         print(f"\n=== making clip {made + 1}/{want}: {label}", flush=True)
+        m["pick"] = made + 1                       # which of the day's choices this was
+        spec.write_text(json.dumps(m, ensure_ascii=False))
         progress.report("Finding the best moments", pool + made, total, f"making {label}", started_at=t0)
         rc = subprocess.run(clip_cmd(m, spec), env=env).returncode
         if rc == 0:
