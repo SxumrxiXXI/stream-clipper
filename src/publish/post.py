@@ -273,7 +273,7 @@ def youtube_title(item: dict) -> str:
     title = item["captions"]["youtube_title"].strip()
     game = item.get("game") or ""
     short = {"Counter-Strike": "CS2", "World of Warcraft": "WoW", "League of Legends": "LoL",
-             "Grand Theft Auto V": "GTA"}.get(game, game)
+             "Grand Theft Auto V": "GTA", "Grand Theft Auto VI": "GTA 6"}.get(game, game)
     # People search Shorts by game: make sure the title names it.
     named = any(w.lower() in title.lower() for w in (game, short) if w)
     if game and not named and len(title) + len(short) + 3 <= 95:

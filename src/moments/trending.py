@@ -96,8 +96,17 @@ class Twitch:
             if c.get("video_id") and c.get("vod_offset") is not None:
                 clips.append({"vod_id": c["video_id"], "offset": float(c["vod_offset"]),
                               "seconds": float(c.get("duration") or 30), "views": c["view_count"],
-                              "title": c["title"], "url": c["url"]})
+                              "title": c["title"], "url": c["url"], "game_id": c.get("game_id") or ""})
         return clips
+
+    def game_names(self, ids: list[str]) -> dict[str, str]:
+        """Category names for Twitch game ids (looked up once each)."""
+        cache = self.__dict__.setdefault("_game_names", {})
+        missing = [i for i in dict.fromkeys(ids) if i and i not in cache]
+        for n in range(0, len(missing), 100):
+            for g in self.get("games", id=missing[n:n + 100]):
+                cache[g["id"]] = g["name"]
+        return {i: cache.get(i, "") for i in ids}
 
 
 def _seconds(text: str) -> int:
