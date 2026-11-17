@@ -273,7 +273,7 @@ def youtube_title(item: dict) -> str:
     title = item["captions"]["youtube_title"].strip()
     game = item.get("game") or ""
     short = {"Counter-Strike": "CS2", "World of Warcraft": "WoW", "League of Legends": "LoL",
-             "Grand Theft Auto V": "GTA"}.get(game, game)
+             "Grand Theft Auto V": "GTA", "Grand Theft Auto VI": "GTA 6"}.get(game, game)
     # People search Shorts by game: make sure the title names it.
     named = any(w.lower() in title.lower() for w in (game, short) if w)
     if game and not named and len(title) + len(short) + 3 <= 95:
@@ -613,6 +613,8 @@ def report(items: list[dict]) -> None:
             print(f"{name[:22]:<22} {len(v):>5} {sum(v) / len(v):>10,.0f} {max(v):>8,}")
     table("moment type", lambda i: i.get("kind") or "not judged")
     table("judge rating", lambda i: (f"{i['judge']['overall']}/10" if i.get("judge") else "not judged"))
+    table("found by", lambda i: i.get("found_by") or "not recorded")
+    table("the day's pick", lambda i: {1: "1st", 2: "2nd", 3: "3rd"}.get(i.get("pick"), "not recorded"))
     table("format", lambda i: i.get("format") or "classic")
     table("caption style", lambda i: i.get("style", "long"))
     table("Instagram hashtags", lambda i: "none" if i.get("ig_tags") is False else "with tags")

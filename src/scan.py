@@ -41,6 +41,31 @@ from trending import Twitch  # noqa: E402
 hms = chat_spikes.hms
 
 
+def featured_today(posting: dict, today: dt.date | None = None) -> tuple[str, int, str]:
+    """Which game is featured today and how strongly: (game in lower case, clips kept
+    for it, phase).
+
+    Phases, from the settings: nothing before `focus_start`; for `focus_full_days`
+    days from then every clip of the day is the featured game ("all"); after that
+    `focus_min_clips` of them ("share"). Whatever the phase, a slot the featured
+    game cannot fill with a moment the judge kept goes to the best other clip.
+    """
+    game = str(posting.get("focus_game") or "").strip().lower()
+    if not game:
+        return "", 0, "off"
+    pretend = os.environ.get("CLIP_PRETEND_DATE", "")           # rehearsals only
+    today = today or (dt.date.fromisoformat(pretend) if pretend else dt.date.today())
+    start = posting.get("focus_start")
+    if start:
+        start = start if isinstance(start, dt.date) else dt.date.fromisoformat(str(start))
+        if today < start:
+            return "", 0, "before"
+        if today < start + dt.timedelta(days=int(posting.get("focus_full_days", 0))):
+            return game, 99, "all"
+    share = int(posting.get("focus_min_clips", 0))
+    return (game, share, "share") if share > 0 else ("", 0, "off")
+
+
 def read_env() -> dict:
     env = {}
     path = ROOT / ".env"
@@ -161,8 +186,12 @@ def moments_for_vod(vod: dict, viewer_clips: list[dict], per_vod: int) -> list[d
                 "clips": [[c["offset"], c["title"], c["views"]]],
                 "score": round(10 * math.log10(1 + c["views"]), 1), "why": "viewers clipped it",
             })
-    out.sort(key=lambda m: m["score"], reverse=True)
-    return out[:per_vod]
+    # The strongest chat moments, plus the most-viewed clips viewers made while
+    # chat stayed calm. Those score low on the chat scale, so without their own
+    # places they would always be cut here and never be looked at.
+    by_chat = sorted((m for m in out if m["chatters"]), key=lambda m: m["score"], reverse=True)[:per_vod]
+    by_view = sorted((m for m in out if not m["chatters"]), key=lambda m: m["viewer_clip_views"], reverse=True)[:3]
+    return sorted(by_chat + by_view, key=lambda m: m["score"], reverse=True)
 
 
 def scan(a) -> None:
@@ -177,7 +206,13 @@ def scan(a) -> None:
              "skip_title_words": [str(w).lower() for w in posting.get("skip_title_words") or []],
              "max_per_streamer": int(posting.get("max_per_streamer") or 99),
              "tournament_words": [str(w).lower() for w in posting.get("tournament_words") or []],
-             "max_tournament_clips": int(posting.get("max_tournament_clips", 99))}
+             "max_tournament_clips": int(posting.get("max_tournament_clips", 99)),
+             "viewer_clip_every": int(posting.get("viewer_clip_every", 3)),
+             "viewer_clip_min_views": int(posting.get("viewer_clip_min_views", 300)),
+             "compare_runs": int(posting.get("compare_runs", 3)),
+             "focus_game": featured_today(posting)[0],
+             "focus_min_clips": featured_today(posting)[1],
+             "focus_phase": featured_today(posting)[2]}
     streamers = [s for s in streamers if str(s.get("twitch", "")).lower() not in rules["skip_channels"]]
     found = []
     t_scan = progress.report("Scanning streamers", 0, len(streamers), streamers[0]["name"], step_seconds=40)
@@ -196,9 +231,18 @@ def scan(a) -> None:
         print(f"{s['name']} [{s['status']}]: {len(vods)} streams" + (f", {len(clips)} viewer clips" if tw else ""))
         for v in vods:
             print(f"   {hms(v['seconds'])}  {v['title'][:70]}")
+            # Which game was on screen at that point of the stream. Twitch labels a
+            # whole stream with one category, but every viewer clip carries the
+            # category of the moment it was cut from: the nearest clip, within 45
+            # minutes, tells us. Otherwise the streamer's usual game is the guess.
+            here = [c for c in clips if c["vod_id"] == v["id"] and c.get("game_id")]
+            names = tw.game_names([c["game_id"] for c in here]) if tw and here else {}
             for m in moments_for_vod(v, clips, a.per_vod):
+                near = min(here, key=lambda c: abs(c["offset"] - m["burst_start"]), default=None)
+                seen = names.get(near["game_id"], "") if near and abs(near["offset"] - m["burst_start"]) <= 2700 else ""
                 found.append({**m, "streamer": s["name"], "status": s["status"],
-                              "game": (s.get("games") or [""])[0],
+                              "game": seen or (s.get("games") or [""])[0],
+                              "game_from": "a viewer clip nearby" if seen else "the streamer's usual game",
                               "credit": s.get("credit", s["name"]), "permission": s.get("permission", ""),
                               "campaign": s.get("campaign", "general"),
                               "vod_url": v["url"], "vod_title": v["title"]})
@@ -260,6 +304,42 @@ def scan(a) -> None:
         print("\nno new moments to look at (everything strong was already clipped or rejected)")
         return
 
+    # Chat is not the only witness. On ten streams chat bursts caught 37% of the
+    # moments viewers clipped (64% by clip views; study of 2026-11-16). So moments
+    # viewers clipped while chat stayed calm get every third place in the pool,
+    # biggest clip first, provided the clip has a real audience.
+    every = rules["viewer_clip_every"]
+    by_chat = [m for m in candidates if m.get("chatters")]
+    by_view = sorted((m for m in candidates if not m.get("chatters")
+                      and m.get("viewer_clip_views", 0) >= rules["viewer_clip_min_views"]),
+                     key=lambda m: -m["viewer_clip_views"])
+    if every > 1:
+        candidates = []
+        while by_chat or by_view:
+            candidates += [by_chat.pop(0) for _ in range(min(every - 1, len(by_chat)))]
+            if by_view:
+                candidates.append(by_view.pop(0))
+    else:
+        candidates = by_chat
+    # A game the owner wants featured gets every other place in the pool, so the
+    # judge sees enough of it to fill its share of the day's clips.
+    focus = rules["focus_game"]
+    def featured(m: dict) -> bool:
+        return bool(focus) and m.get("game", "").lower() == focus
+    if focus and rules["focus_min_clips"] > 0:
+        ours, rest = [m for m in candidates if featured(m)], [m for m in candidates if not featured(m)]
+        if rules["focus_phase"] == "all":
+            # Every clip of the day should be the featured game: its moments first,
+            # two others at the front of the rest as cover if too few of them pass.
+            candidates = ours[:7] + rest[:2] + ours[7:] + rest[2:]
+        else:
+            candidates = []
+            while ours or rest:
+                if ours:
+                    candidates.append(ours.pop(0))
+                if rest:
+                    candidates.append(rest.pop(0))
+
     # Two passes. First the judge (moments/judge.py) watches more candidates
     # than we need; then clips are made from the ones it rated best. Taking the
     # best of a pool beats taking the first few that merely pass.
@@ -302,6 +382,30 @@ def scan(a) -> None:
 
     # Best first: the judge's rating, with the size of chat's reaction as tie-break.
     kept.sort(key=lambda ms: (ms[0]["verdict"]["rank"], ms[0]["score"]), reverse=True)
+    # The judge's own scores bunch at 8 and 9, so they barely order anything. The
+    # candidates it kept are therefore compared with each other, several times in
+    # different orders, and the average place decides. This only orders them: it
+    # never rejects one.
+    if len(kept) > want and rules["compare_runs"] > 0:
+        try:
+            import judge
+            entries = [{"id": str(spec), "video": Path(m["window"]), "streamer": m["streamer"],
+                        "game": m.get("game", "")} for m, spec in kept if m.get("window") and Path(m["window"]).exists()]
+            if len(entries) == len(kept):
+                table, cost = judge.compare(entries, runs=rules["compare_runs"])
+                for m, spec in kept:
+                    m["compare"] = {**table[str(spec)], "of": len(kept)}
+                kept.sort(key=lambda ms: (ms[0]["compare"]["mean"], -ms[0]["verdict"]["rank"]))
+                print(f"\ncompared {len(kept)} candidates with each other, {len(next(iter(table.values()))['ranks'])} "
+                      f"valid runs, ${cost:.3f}:")
+                for m, _ in kept:
+                    c = m["compare"]
+                    print(f"   avg place {c['mean']:>4.1f}  {str(c['ranks']):<14} {m['streamer'][:16]:<16} "
+                          f"{hms(m['burst_start'])}  {m['verdict']['hook'][:60]}")
+            else:
+                print("\nsome stretches are no longer on disk: keeping the judge's own order")
+        except Exception as e:
+            print(f"\nthe comparison could not run ({str(e)[:140]}): keeping the judge's own order")
     if not kept and unjudged:
         print("\nthe judge could not run; falling back to chat ranking with OpenShorts choosing the cuts")
     order = kept + unjudged
@@ -310,23 +414,53 @@ def scan(a) -> None:
         v = m["verdict"]
         print(f"   {v['rank']:>5}  {m['streamer'][:16]:<16} {hms(m['burst_start'])}  [{v['moment_type']}]  {v['hook']}")
 
-    made, per, tournament = 0, defaultdict(int), 0
-    for m, spec in order:
-        if made >= want:
+    # The featured game's share: that many of the day's clips, as long as the judge
+    # kept that many of its moments and confirmed the game is what is on screen.
+    def confirmed(m: dict) -> bool:
+        return featured(m) and (m.get("verdict") or {}).get("game_label_ok", True)
+    waiting = sum(1 for m, _ in order if confirmed(m))
+    target = min(rules["focus_min_clips"], waiting, want) if focus else 0
+    if focus:
+        print(f"\n{rules['focus_game']} ({'launch week: every clip' if rules['focus_phase'] == 'all' else 'its share'}): "
+              f"{waiting} of the kept candidates are it; aiming for {target} of today's {want} clips")
+    made, per, tournament, ours_made, others_made = 0, defaultdict(int), 0, 0, 0
+    tried: set[int] = set()
+    while made < want:
+        # The best candidate not yet tried that the day's limits still allow. It is
+        # looked for from the top each time, so when a clip fails to come out, a
+        # candidate passed over earlier gets its chance back.
+        pick = None
+        for idx, (m, spec) in enumerate(order):
+            if idx in tried or per[m["streamer"]] >= rules["max_per_streamer"]:
+                continue
+            feed = any(w in m["streamer"].lower() for w in rules["tournament_words"])
+            if feed and tournament >= rules["max_tournament_clips"]:
+                continue                       # enough from tournament broadcasts today
+            if focus and not confirmed(m):
+                # Leave room for the featured clips still to come.
+                still = sum(1 for j, (x, _) in enumerate(order) if j not in tried and confirmed(x)
+                            and per[x["streamer"]] < rules["max_per_streamer"])
+                if others_made >= want - min(target, ours_made + still):
+                    continue
+            pick = idx
             break
-        if per[m["streamer"]] >= rules["max_per_streamer"]:
-            continue
+        if pick is None:
+            break
+        tried.add(pick)
+        m, spec = order[pick]
         feed = any(w in m["streamer"].lower() for w in rules["tournament_words"])
-        if feed and tournament >= rules["max_tournament_clips"]:
-            continue                       # enough from tournament broadcasts today
         label = f"{m['streamer']} at {hms(m['burst_start'])}"
         print(f"\n=== making clip {made + 1}/{want}: {label}", flush=True)
+        m["pick"] = made + 1                       # which of the day's choices this was
+        spec.write_text(json.dumps(m, ensure_ascii=False))
         progress.report("Finding the best moments", pool + made, total, f"making {label}", started_at=t0)
         rc = subprocess.run(clip_cmd(m, spec), env=env).returncode
         if rc == 0:
             made += 1
             per[m["streamer"]] += 1
             tournament += 1 if feed else 0
+            ours_made += 1 if confirmed(m) else 0
+            others_made += 0 if confirmed(m) else 1
         elif rc == 3:
             print("    turned down on a closer look; moving on to the next candidate")
         else:
@@ -366,6 +500,12 @@ def discover(a, tw: Twitch | None = None) -> list[dict]:
     else:
         skip = {x.strip().lower() for x in (a.skip or "").split(",") if x.strip()}
         games = [g for g in tw.top_games(a.games * 2) if g["name"].lower() not in skip][: a.games]
+        # A game the owner wants featured is always covered, however it ranks today.
+        want_game = featured_today(yaml.safe_load((ROOT / "config" / "posting.yaml").read_text()) or {})[0]
+        if want_game and want_game not in {g["name"].lower() for g in games}:
+            g = tw.game(want_game)
+            if g:
+                games.append(g)
 
     people: dict[str, dict] = {}
     rows = []
@@ -394,7 +534,18 @@ def discover(a, tw: Twitch | None = None) -> list[dict]:
     # Several well-viewed clips beat one viral one: that streamer is reliable material.
     for p in people.values():
         p["score"] = round(p["clip_views"] * (1 + math.log2(p["clips"])) / 1000, 1)
-    ranked = sorted(people.values(), key=lambda p: -p["score"])[: max(a.top, a.add)]
+    ranked = sorted(people.values(), key=lambda p: -p["score"])
+    if not a.game:
+        # Half the watchlist goes to the featured game's streamers, best first; the
+        # rest to the best of everything else.
+        fg, _, phase = featured_today(yaml.safe_load((ROOT / "config" / "posting.yaml").read_text()) or {})
+        if fg:
+            n = max(a.top, a.add)
+            # ...but only streamers whose clips are actually being watched: before the
+            # game is out its category is full of channels with a handful of views.
+            ours = [p for p in ranked if fg in {x.lower() for x in p["games"]} and p["clip_views"] >= 300][: n * 4 // 5 if phase == "all" else n // 2]
+            ranked = sorted(ours + [p for p in ranked if p not in ours][: n - len(ours)], key=lambda p: -p["score"])
+    ranked = ranked[: max(a.top, a.add)]
     logins = tw.logins([p["id"] for p in ranked])
     print(f"\n{'#':>2}  {'streamer':<22} {'clips':>5} {'clip views':>11} {'live now':>9} {'score':>8}  categories")
     for i, p in enumerate(ranked[: a.top], 1):

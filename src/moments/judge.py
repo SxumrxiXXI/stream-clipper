@@ -44,6 +44,7 @@ class Verdict(BaseModel):
     event_happened: bool        # a discrete thing occurs (a play, a fail, a joke landing, an outburst)
     chat_was_prompted: bool     # chat is typing because it was asked to (vote, answer, mini-game, giveaway)
     needs_earlier_context: bool
+    watching_a_video: bool      # the stream is showing someone else's video or clip, and that is the moment
     reaction_in_clip: bool      # the streamer, casters or crowd audibly or visibly react
     has_clear_moment: bool
     start: str                  # "MM:SS" in the video; the model is steadier with clock times
@@ -92,6 +93,9 @@ Watch and listen to the whole video, then decide.
      a giveaway, an emote the stream told them to spam? If chat is answering or playing
      along rather than reacting to something that just happened, answer true.
    - needs_earlier_context: would a stranger need to have seen earlier parts of the stream?
+   - watching_a_video: is the thing being reacted to a video, clip or post by someone else
+     that the streamer is playing in a browser or player (a reaction to other people's
+     content)? Gameplay, the streamer's own camera and a tournament broadcast are not this.
    - reaction_in_clip: can you hear or see the streamer, casters or a crowd react?
 
 1. has_clear_moment: true only if ONE specific thing happens that chat is reacting to and that
@@ -269,6 +273,10 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
     v["game_label_ok"] = bool(v.get("game_label_ok", True))
     # The yes/no facts gate the clip; the scores only rank what passes.
     reasons = []
+    if v.get("watching_a_video"):
+        # A clip of someone watching a clip is other people's footage twice over,
+        # and mostly shows a browser window.
+        reasons.append("the streamer is watching someone else's video")
     if not v["has_clear_moment"] or v["moment_type"] == "none":
         reasons.append("no clear moment")
     if not v["event_happened"]:
@@ -378,6 +386,107 @@ def verify(video: Path, statements: list[str], *, start: float, end: float,
         out.append({"statement": x, "status": status if status in ("supported", "contradicted") else "unverifiable",
                     "evidence": str(c.get("evidence", ""))[:200], "only_describes": bool(c.get("only_describes"))})
     return out
+
+
+class Place(BaseModel):
+    label: str
+    why: str
+
+
+class Order(BaseModel):
+    ranking: list[str]            # every label once, best first
+    reasons: list[Place]
+
+
+COMPARE_PROMPT = """You choose what a short-form clips page posts today. Below are {n} videos from live streams,
+labelled V1 to V{n} in the order they are given. Each is about 90 seconds around one moment; the page
+would cut the best 10 to 30 seconds from it.
+
+Compare them with each other and rank all {n} from best to worst for strangers scrolling a feed:
+which would make someone stop, understand it with no context, get a clear payoff, and send it to a friend.
+You must give a strict order with no ties, naming every label exactly once. Judge what is actually in
+the footage and the sound, and keep each video's label straight. Give a one-line reason for every video."""
+
+
+def compare(entries: list[dict], runs: int = 3) -> tuple[dict, float]:
+    """Order candidates by comparing their footage with each other.
+
+    `entries` are {"id", "video": Path, "streamer", "game"}. The model ranks them
+    all in one call, `runs` times with the videos in a different order each time
+    (one call's order depends on where a video sits in the list), and a
+    candidate's place is the average. Returns ({id: {"mean": place, "ranks":
+    [place per valid run]}}, cost in dollars). Raises if no run gave a usable
+    order; the caller then keeps the order it had.
+    """
+    import random
+    import subprocess
+
+    key, model = api_key()
+    client = genai.Client(api_key=key)
+    small, up = {}, {}
+    try:
+        for e in entries:
+            # Ranking needs the gist, not the pixels: 480p at 10 fps keeps a whole
+            # day's candidates inside one cheap call.
+            dst = e["video"].with_name("cmp_" + e["video"].name)
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(e["video"]), "-vf", "scale=-2:480,fps=10",
+                            "-c:v", "libx264", "-crf", "30", "-preset", "veryfast", "-c:a", "aac", "-b:a", "48k",
+                            "-ac", "1", str(dst)], check=True, capture_output=True)
+            small[e["id"]] = dst
+            with open(dst, "rb") as fh:
+                up[e["id"]] = client.files.upload(file=fh, config={"mime_type": "video/mp4", "display_name": dst.name})
+        deadline = time.time() + 300
+        for f in up.values():
+            while str(getattr(getattr(client.files.get(name=f.name), "state", ""), "name", "")).upper() != "ACTIVE":
+                if time.time() > deadline:
+                    raise RuntimeError("Gemini did not finish processing the videos")
+                time.sleep(2)
+        ids = [e["id"] for e in entries]
+        info = {e["id"]: e for e in entries}
+        places: dict[str, list[int]] = {i: [] for i in ids}
+        cost = 0.0
+        for k in range(runs):
+            order = ids[:]
+            random.Random(1000 + k).shuffle(order)
+            labels, parts = {}, []
+            for n, i in enumerate(order, 1):
+                labels[f"V{n}"] = i
+                parts += [f"V{n}: channel {info[i].get('streamer') or 'unknown'}, "
+                          f"game or category {info[i].get('game') or 'unknown'}", up[i]]
+            resp = None
+            for attempt in range(3):            # the service drops the odd call
+                try:
+                    resp = client.models.generate_content(
+                        model=model, contents=parts + [COMPARE_PROMPT.format(n=len(order))],
+                        config=types.GenerateContentConfig(response_mime_type="application/json",
+                                                           response_schema=Order))
+                    break
+                except Exception:
+                    time.sleep(10)
+            if resp is None:
+                continue
+            usage = getattr(resp, "usage_metadata", None)
+            cost += ((getattr(usage, "prompt_token_count", 0) or 0) * 0.25e-6
+                     + (getattr(usage, "candidates_token_count", 0) or 0) * 1.5e-6)
+            try:
+                got = [labels.get(str(x).strip().upper()) for x in json.loads(resp.text).get("ranking") or []]
+            except ValueError:
+                continue
+            if sorted(x for x in got if x) != sorted(ids) or len(got) != len(ids):
+                continue                         # a label missing or named twice: this run does not count
+            for place, i in enumerate(got, 1):
+                places[i].append(place)
+        if not places[ids[0]]:
+            raise RuntimeError("no comparison run gave a complete order")
+        return {i: {"mean": round(sum(p) / len(p), 2), "ranks": p} for i, p in places.items()}, cost
+    finally:
+        for f in up.values():
+            try:
+                client.files.delete(name=f.name)
+            except Exception:
+                pass
+        for dst in small.values():
+            dst.unlink(missing_ok=True)
 
 
 def main() -> None:
