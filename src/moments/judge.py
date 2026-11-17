@@ -17,7 +17,9 @@ needs earlier context is rejected, and no clip is made from it.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -59,10 +61,6 @@ class Verdict(BaseModel):
     caption: str
     youtube_title: str
     names_in_text: list[str]
-    # What the page adds to the footage (see "6." in the prompt). Empty when
-    # nothing true can be said beyond what the picture already shows.
-    context_before: str
-    context_after: str
     question: str               # one real question about the moment, for platforms built on replies
     game_label_ok: bool         # does the game named above match what is on screen?
 
@@ -142,25 +140,7 @@ Watch and listen to the whole video, then decide.
    problems: anything that weakens the clip (empty list if none).
    moment_type: one of funny, clutch, fail, rage, shock, wholesome, hot_take, story, none.
 
-6. Context the page adds. This is what makes the post more than a copy of the footage, so
-   it must tell the viewer something they could NOT get from simply watching the clip.
-   Never describe what is visibly happening ("he shoots three players"): that adds nothing.
-   Good context is a fact from the scoreboard, the casters, the streamer's own words, the
-   stream title or the earlier part of this video: the score or the stakes, what the player
-   had left, what was on the line, what a rule, item or ability means, who the person is,
-   or what the result changed.
-   - context_before: at most 9 words. The situation or stakes going INTO the moment, shown
-     on screen from the start of your cut until payoff_at. It replaces the hook, so it must
-     also make the viewer want the outcome and must not give the outcome away.
-     Examples of the kind of line (never reuse their wording): "Down 0-2, one life left,
-     no healing", "His first ranked game after a two-year break".
-   - context_after: at most 9 words. What the moment led to or why it mattered, shown from
-     payoff_at to the end: the new score, what it won or cost, a record, the consequence.
-     Examples of the kind (never reuse their wording): "That kill forced overtime",
-     "It cost him the whole run: 3 hours gone".
-   - Every word must be true and checkable in this video or the context given above. No
-     invented numbers, scores, names or records. If you cannot state such a fact, return
-     an empty string for that line; an empty line is far better than a guess.
+6. Two more things:
    - question: one genuine question about this moment that viewers would disagree on, at
      most 90 characters ("Right call to push with 12 seconds left?"). Not "thoughts?",
      not "who did it better?", nothing that just asks for likes, comments or follows.
@@ -225,11 +205,18 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
         prompt = PROMPT.format(duration=mmss(duration), burst=mmss(burst), streamer=streamer or "unknown",
                                game=game or "unknown", title=title or "unknown", kind=kind or "unknown",
                                viewer_clips=clips_text, chat=chat_text, min_s=MIN_SECONDS, max_s=MAX_SECONDS)
-        resp = client.models.generate_content(
-            model=model, contents=[up, prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json",
-                                               response_schema=Verdict, temperature=0.2))
-        v = json.loads(resp.text)
+        for attempt in range(2):            # the service drops the odd call
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents=[up, prompt],
+                    config=types.GenerateContentConfig(response_mime_type="application/json",
+                                                       response_schema=Verdict, temperature=0.2))
+                v = json.loads(resp.text)
+                break
+            except Exception:
+                if attempt:
+                    raise
+                time.sleep(8)
     finally:
         try:
             client.files.delete(name=up.name)
@@ -266,9 +253,6 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
         while words and words[-1].lower().strip(".,:") in DANGLING:
             words.pop()
     v["hook"] = " ".join(words).strip()
-    for k, limit in (("context_before", 11), ("context_after", 11)):
-        w = str(v.get(k) or "").strip().strip('"').split()
-        v[k] = " ".join(w) if len(w) <= limit else ""      # an over-long line is dropped, not chopped
     v["question"] = str(v.get("question") or "").strip()[:110]
     v["game_label_ok"] = bool(v.get("game_label_ok", True))
     # The yes/no facts gate the clip; the scores only rank what passes.
@@ -302,90 +286,176 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
     return v
 
 
-class Check(BaseModel):
-    statement: str
-    status: str                 # supported | contradicted | unverifiable
-    evidence: str               # what was seen or heard, with its MM:SS
-    only_describes: bool        # it just narrates the action the viewer is watching
+class Quotes(BaseModel):
+    before: list[str]
+    after: list[str]
 
 
-class Checks(BaseModel):
-    checks: list[Check]
+PICK_PROMPT = """You help the editor of a clips page. A short clip was cut from a live stream. Its viewers
+see and hear ONLY the clip. The page prints one line at the top of the clip that tells them
+something the clip does not: words that were said on the stream just BEFORE the clip
+(printed as: Moments before: "...") or just AFTER it (printed as: Right after: "...").
 
+The clip is about this: {what}
+Channel: {streamer}. Game or category: {game}.
 
-CHECK_PROMPT = """You are a fact-checker for a clips page. An editor wants to print the statements
-below ON SCREEN over the part of this video from {start} to {end} (MM:SS). A wrong statement
-would be published under the page's name, so be strict.
+Transcript of the stretch of stream around the clip, as "MM:SS text". [IN CLIP] lines are
+heard by the viewer. [BEFORE] and [AFTER] lines are not in the clip.
 
-What you may rely on: the video itself (scoreboard, kill feed, name tags, on-screen text),
-what people in it say, and this transcript of the speech, "MM:SS text":
 {transcript}
 
-Known for certain: channel {streamer}; game or category {game}.
-
-For each statement decide:
-- supported: you can point to the exact evidence (what is shown or said, and when). Names of
-  people and teams, scores and numbers must match the evidence exactly, and the statement
-  must be about the player, team or person the clip actually shows.
-- contradicted: the video or transcript shows otherwise.
-- unverifiable: it may be true, but you cannot point to evidence for every part of it.
-Guessing "supported" is the one mistake that matters. When in doubt, answer unverifiable.
-
-Also answer only_describes for each statement: true if it merely narrates the action the
-viewer watches happen anyway ("he tries to catch a fish", "he shoots three players"); false
-if it adds something a casual viewer would not take from watching: the score or stakes,
-what was on the line, background on the person, what a rule or item means, or what the
-moment led to.
-
-Statements:
-{statements}
+Pick the words worth printing:
+- before: up to 3 excerpts from [BEFORE] lines that set this event up: what the streamer
+  had just claimed, planned, predicted, been warned about or been trying to do. Printed
+  while the viewer waits for the outcome, so it must not give the outcome away.
+- after: up to 3 excerpts from [AFTER] lines about what just happened: the excuse, the
+  verdict, the regret, what it cost.
+Rules for every excerpt:
+- Copy it exactly from ONE [BEFORE] or [AFTER] line: 3 to 9 words in a row, a complete
+  thought that a stranger understands with no other knowledge. Never from an [IN CLIP] line.
+- It must be about the event in the clip. Most things said near a moment are about
+  something else (another topic, a tip, an aside to chat): leave those out, however odd or
+  funny they are.
+- No filler: greetings, thanks, "oh my god", "let's go", half sentences, garbled words.
+Best first. Empty lists are the right answer when nothing said outside the clip is about
+the event; that is common.
 """
 
 
-def verify(video: Path, statements: list[str], *, start: float, end: float,
-           transcript: list[tuple[float, str]], streamer: str = "", game: str = "") -> list[dict]:
-    """A second, narrower look: are these on-screen statements backed by the video?
+def pick_quotes(*, what: str, streamer: str, game: str,
+                transcript: list[tuple[str, float, str]]) -> tuple[dict, float]:
+    """Words said just outside a finished cut that are worth printing on it.
 
-    Returns one {statement, status, evidence} per statement, in order. Raises on
-    API errors; the caller then prints nothing it could not check.
+    `transcript` is [(label, seconds, text)] with label BEFORE, IN CLIP or
+    AFTER relative to the clip. Text only. Returns ({"before": [excerpt],
+    "after": [excerpt]}, cost in dollars); clip.py still checks every excerpt
+    against the transcript and has screen_quotes() look at it again.
     """
-    statements = [x for x in statements if x]
-    if not statements:
-        return []
+    if not any(label in ("BEFORE", "AFTER") for label, _, _ in transcript):
+        return {"before": [], "after": []}, 0.0
     key, model = api_key()
     client = genai.Client(api_key=key)
-    with open(video, "rb") as fh:
-        up = client.files.upload(file=fh, config={"mime_type": "video/mp4", "display_name": video.name})
-    try:
-        deadline = time.time() + 180
-        while True:
-            state = str(getattr(getattr(client.files.get(name=up.name), "state", ""), "name", "")).upper()
-            if state == "ACTIVE":
-                break
-            if state == "FAILED" or time.time() > deadline:
-                raise RuntimeError(f"Gemini could not process the video ({state or 'timeout'})")
-            time.sleep(2)
-        prompt = CHECK_PROMPT.format(
-            start=mmss(start), end=mmss(end), streamer=streamer or "unknown", game=game or "unknown",
-            transcript="\n".join(f"  {mmss(t)} {text}" for t, text in transcript) or "  (no speech)",
-            statements="\n".join(f"{n}. {x}" for n, x in enumerate(statements, 1)))
-        resp = client.models.generate_content(
-            model=model, contents=[up, prompt],
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Checks,
-                                               temperature=0))
-        got = json.loads(resp.text).get("checks") or []
-    finally:
-        try:
-            client.files.delete(name=up.name)
-        except Exception:
-            pass
+    prompt = PICK_PROMPT.format(
+        what=what, streamer=streamer or "unknown", game=game or "unknown",
+        transcript="\n".join(f"  [{label}] {mmss(t)} {text}" for label, t, text in transcript))
+    resp = client.models.generate_content(
+        model=model, contents=[prompt],
+        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Quotes,
+                                           temperature=0.3))
+    got = json.loads(resp.text)
+    out = {}
+    for role in ("before", "after"):
+        seen = []
+        for q in got.get(role) or []:
+            q = " ".join(str(q or "").strip().strip('"“”').split())
+            if q and q not in seen:
+                seen.append(q)
+        out[role] = seen[:3]
+    usage = getattr(resp, "usage_metadata", None)
+    return out, ((getattr(usage, "prompt_token_count", 0) or 0) * 0.25e-6
+                 + (getattr(usage, "candidates_token_count", 0) or 0) * 1.5e-6)
+
+
+class Screened(BaseModel):
+    number: int
+    about_the_event: bool
+    clear_alone: bool
+    spoils: bool
+
+
+class Screen(BaseModel):
+    lines: list[Screened]
+    best_before: int            # number of the line to print before the payoff; 0 = none
+    best_after: int
+
+
+SCREEN_PROMPT = """You are the editor of a clips page. A short clip from a live stream is about this event:
+{what}
+
+Below are things that were said on the stream shortly before or after the clip (they are
+not in the clip). One of them may be printed on the clip as context, for example:
+Moments before: "..."   or   Right after: "..."
+Most things said near a moment have nothing to do with it. A line is worth printing only
+if a stranger who reads it understands the event better or enjoys it more.
+
+{lines}
+
+For every line answer three questions:
+- about_the_event: true only if the words are plainly about this event: the same attempt,
+  fight, call, joke or mistake, what led to it or what came of it. Words about anything
+  else (another topic, a tip, an aside to chat, a different part of the game) are false. If
+  you have to guess how they connect, answer false.
+- clear_alone: true if a stranger understands the words with no other knowledge of the
+  stream. A fragment, garbled words or an inside reference: false.
+- spoils: true if the words tell the viewer how the event ends.
+Then choose. best_before: the number of the one line said BEFORE the clip that would most
+make a stranger want to see how the event ends, or 0 if none is worth printing. best_after:
+the number of the one line said AFTER it that adds most to what the viewer just saw, or 0.
+A weak line is worse than no line.
+"""
+
+
+def screen_quotes(what: str, quotes: list[tuple[str, str]]) -> tuple[list[dict], dict]:
+    """A second, separate look at the excerpts: [(before | after, words)].
+
+    Returns ([{about_the_event, clear_alone, spoils} per excerpt, in order],
+    {"before": index of the editor's pick or None, "after": ...}). Text only.
+    """
+    if not quotes:
+        return [], {"before": None, "after": None}
+    key, model = api_key()
+    client = genai.Client(api_key=key)
+    listing = "\n".join(f'{n}. said {"BEFORE" if role == "before" else "AFTER"} the clip: "{q}"'
+                        for n, (role, q) in enumerate(quotes, 1))
+    resp = client.models.generate_content(
+        model=model, contents=[SCREEN_PROMPT.format(what=what or "a moment from a live stream", lines=listing)],
+        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=Screen,
+                                           temperature=0))
+    got = json.loads(resp.text)
+    by_number = {int(x.get("number") or 0): x for x in got.get("lines") or []}
     out = []
-    for n, x in enumerate(statements):
-        c = got[n] if n < len(got) else {}
-        status = str(c.get("status", "")).lower().strip()
-        out.append({"statement": x, "status": status if status in ("supported", "contradicted") else "unverifiable",
-                    "evidence": str(c.get("evidence", ""))[:200], "only_describes": bool(c.get("only_describes"))})
-    return out
+    for n in range(1, len(quotes) + 1):
+        x = by_number.get(n) or {}
+        # An excerpt the model did not answer for counts as failed.
+        out.append({"about_the_event": bool(x.get("about_the_event")), "clear_alone": bool(x.get("clear_alone")),
+                    "spoils": bool(x.get("spoils", True)) if not x else bool(x.get("spoils"))})
+    best = {}
+    for role, k in (("before", "best_before"), ("after", "best_after")):
+        try:
+            n = int(got.get(k) or 0) - 1
+        except (TypeError, ValueError):
+            n = -1
+        best[role] = n if 0 <= n < len(quotes) and quotes[n][0] == role else None
+    return out, best
+
+
+def _norm(text: str) -> list[str]:
+    return re.sub(r"[^a-z0-9' ]+", " ", text.lower().replace("’", "'")).split()
+
+
+def quoted(text: str) -> list[str]:
+    """The quotations inside a line: 'Before: "no way he wins"' -> ['no way he wins']."""
+    return [q.strip() for q in re.findall(r'["“]([^"“”]{2,})["”]', text) if q.strip()]
+
+
+def find_quote(quote: str, words: list[tuple[float, str]]) -> tuple[float, float] | None:
+    """Where in the transcript these words are spoken, as (start, end) seconds, or
+    None if they are not there. `words` are (time, word) in order. The match is
+    loose enough to survive a misheard word, strict enough that an invented
+    sentence does not pass."""
+    q = _norm(quote)
+    said = [(t, w) for t, raw in words for w in _norm(raw)]
+    if not q or not said:
+        return None
+    need = 1.0 if len(q) <= 2 else 0.85
+    best, where = 0.0, None
+    for size in {len(q), len(q) - 1, len(q) + 1} - {0}:
+        for i in range(0, max(1, len(said) - size + 1)):
+            chunk = said[i:i + size]
+            ratio = difflib.SequenceMatcher(None, q, [w for _, w in chunk]).ratio()
+            if ratio > best:
+                best, where = ratio, (chunk[0][0], chunk[-1][0])
+    return where if best >= need else None
 
 
 class Place(BaseModel):
