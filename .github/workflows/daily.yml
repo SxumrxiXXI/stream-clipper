@@ -43,6 +43,9 @@ on:
       pretend_date:
         description: "Rehearse the featured-game schedule as if it were this date, YYYY-MM-DD (only with dry_run)"
         default: ""
+      pretend_game:
+        description: "Rehearse the featured-game schedule with this game instead, exact Twitch category name (only with dry_run)"
+        default: ""
       simulate:
         description: "Fault to rehearse (only with dry_run)"
         type: choice
@@ -162,6 +165,7 @@ jobs:
         env:
           CLIP_DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '' }}
           CLIP_PRETEND_DATE: ${{ inputs.dry_run && inputs.pretend_date || '' }}
+          CLIP_PRETEND_GAME: ${{ inputs.dry_run && inputs.pretend_game || '' }}
           FORCE: ${{ inputs.force && '1' || '' }}
           CLIPS: ${{ inputs.clips }}
         run: |

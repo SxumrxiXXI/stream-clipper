@@ -51,6 +51,10 @@ def featured_today(posting: dict, today: dt.date | None = None) -> tuple[str, in
     game cannot fill with a moment the judge kept goes to the best other clip.
     """
     game = str(posting.get("focus_game") or "").strip().lower()
+    # Rehearsals only: stand in a game that is out today for one that is not yet,
+    # so the whole schedule can be tried on real streams. Ignored when posting is on.
+    if os.environ.get("CLIP_DRY_RUN") and os.environ.get("CLIP_PRETEND_GAME"):
+        game = os.environ["CLIP_PRETEND_GAME"].strip().lower()
     if not game:
         return "", 0, "off"
     pretend = os.environ.get("CLIP_PRETEND_DATE", "")           # rehearsals only
