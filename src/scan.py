@@ -41,6 +41,30 @@ from trending import Twitch  # noqa: E402
 hms = chat_spikes.hms
 
 
+def featured_today(posting: dict, today: dt.date | None = None) -> tuple[str, int, str]:
+    """Which game is featured today and how strongly: (game in lower case, clips kept
+    for it, phase).
+
+    Phases, from the settings: nothing before `focus_start`; for `focus_full_days`
+    days from then every clip of the day is the featured game ("all"); after that
+    `focus_min_clips` of them ("share"). Whatever the phase, a slot the featured
+    game cannot fill with a moment the judge kept goes to the best other clip.
+    """
+    game = str(posting.get("focus_game") or "").strip().lower()
+    if not game:
+        return "", 0, "off"
+    today = today or dt.date.today()
+    start = posting.get("focus_start")
+    if start:
+        start = start if isinstance(start, dt.date) else dt.date.fromisoformat(str(start))
+        if today < start:
+            return "", 0, "before"
+        if today < start + dt.timedelta(days=int(posting.get("focus_full_days", 0))):
+            return game, 99, "all"
+    share = int(posting.get("focus_min_clips", 0))
+    return (game, share, "share") if share > 0 else ("", 0, "off")
+
+
 def read_env() -> dict:
     env = {}
     path = ROOT / ".env"
@@ -185,8 +209,9 @@ def scan(a) -> None:
              "viewer_clip_every": int(posting.get("viewer_clip_every", 3)),
              "viewer_clip_min_views": int(posting.get("viewer_clip_min_views", 300)),
              "compare_runs": int(posting.get("compare_runs", 3)),
-             "focus_game": str(posting.get("focus_game") or "").strip().lower(),
-             "focus_min_clips": int(posting.get("focus_min_clips", 0))}
+             "focus_game": featured_today(posting)[0],
+             "focus_min_clips": featured_today(posting)[1],
+             "focus_phase": featured_today(posting)[2]}
     streamers = [s for s in streamers if str(s.get("twitch", "")).lower() not in rules["skip_channels"]]
     found = []
     t_scan = progress.report("Scanning streamers", 0, len(streamers), streamers[0]["name"], step_seconds=40)
@@ -302,12 +327,17 @@ def scan(a) -> None:
         return bool(focus) and m.get("game", "").lower() == focus
     if focus and rules["focus_min_clips"] > 0:
         ours, rest = [m for m in candidates if featured(m)], [m for m in candidates if not featured(m)]
-        candidates = []
-        while ours or rest:
-            if ours:
-                candidates.append(ours.pop(0))
-            if rest:
-                candidates.append(rest.pop(0))
+        if rules["focus_phase"] == "all":
+            # Every clip of the day should be the featured game: its moments first,
+            # two others at the front of the rest as cover if too few of them pass.
+            candidates = ours[:7] + rest[:2] + ours[7:] + rest[2:]
+        else:
+            candidates = []
+            while ours or rest:
+                if ours:
+                    candidates.append(ours.pop(0))
+                if rest:
+                    candidates.append(rest.pop(0))
 
     # Two passes. First the judge (moments/judge.py) watches more candidates
     # than we need; then clips are made from the ones it rated best. Taking the
@@ -390,7 +420,8 @@ def scan(a) -> None:
     waiting = sum(1 for m, _ in order if confirmed(m))
     target = min(rules["focus_min_clips"], waiting, want) if focus else 0
     if focus:
-        print(f"\n{rules['focus_game']}: {waiting} of the kept candidates are it; aiming for {target} of today's {want} clips")
+        print(f"\n{rules['focus_game']} ({'launch week: every clip' if rules['focus_phase'] == 'all' else 'its share'}): "
+              f"{waiting} of the kept candidates are it; aiming for {target} of today's {want} clips")
     made, per, tournament, ours_made, others_made = 0, defaultdict(int), 0, 0, 0
     tried: set[int] = set()
     while made < want:
@@ -469,8 +500,8 @@ def discover(a, tw: Twitch | None = None) -> list[dict]:
         skip = {x.strip().lower() for x in (a.skip or "").split(",") if x.strip()}
         games = [g for g in tw.top_games(a.games * 2) if g["name"].lower() not in skip][: a.games]
         # A game the owner wants featured is always covered, however it ranks today.
-        want_game = str((yaml.safe_load((ROOT / "config" / "posting.yaml").read_text()) or {}).get("focus_game") or "")
-        if want_game and want_game.lower() not in {g["name"].lower() for g in games}:
+        want_game = featured_today(yaml.safe_load((ROOT / "config" / "posting.yaml").read_text()) or {})[0]
+        if want_game and want_game not in {g["name"].lower() for g in games}:
             g = tw.game(want_game)
             if g:
                 games.append(g)
@@ -506,12 +537,12 @@ def discover(a, tw: Twitch | None = None) -> list[dict]:
     if not a.game:
         # Half the watchlist goes to the featured game's streamers, best first; the
         # rest to the best of everything else.
-        fg = str((yaml.safe_load((ROOT / "config" / "posting.yaml").read_text()) or {}).get("focus_game") or "").lower()
+        fg, _, phase = featured_today(yaml.safe_load((ROOT / "config" / "posting.yaml").read_text()) or {})
         if fg:
             n = max(a.top, a.add)
             # ...but only streamers whose clips are actually being watched: before the
             # game is out its category is full of channels with a handful of views.
-            ours = [p for p in ranked if fg in {x.lower() for x in p["games"]} and p["clip_views"] >= 300][: n // 2]
+            ours = [p for p in ranked if fg in {x.lower() for x in p["games"]} and p["clip_views"] >= 300][: n * 4 // 5 if phase == "all" else n // 2]
             ranked = sorted(ours + [p for p in ranked if p not in ours][: n - len(ours)], key=lambda p: -p["score"])
     ranked = ranked[: max(a.top, a.add)]
     logins = tw.logins([p["id"] for p in ranked])
