@@ -348,7 +348,10 @@ def context_lines(verdict: dict, parts: list[list[float]], job_id: str, moment: 
     def line(role: str) -> str:
         if not chosen[role]:
             return ""
-        q = chosen[role]["quote"].strip(" ,;:-")
+        said = chosen[role]["quote"].strip(" ,;:-").split()
+        while len(said) > 3 and said[-1].lower().strip(".,!?") in judge.DANGLING:
+            said.pop()                      # "Dumb and Dumber a": the transcript line broke off there
+        q = " ".join(said)
         return f'{FRAMES[role][seed % len(FRAMES[role])]} "{q[:1].upper() + q[1:]}"'
 
     before, after = line("before"), line("after")
@@ -476,11 +479,14 @@ def add_context(job_id: str, video_url: str, before: str, after: str, payoff: fl
                 f"{outline},2,8,{margin_h},{margin_h},{margin_v},1")
 
     payoff = min(max(payoff + 0.3, 2.5), max(2.5, total - 2.5)) if after else total
+    # The second line belongs to the end of the clip: it is about what came after,
+    # and the judge's payoff time can be early. Seven seconds is enough to read it.
+    late = max(payoff, total - 7.0)
     events = []
     if before:
         events.append(f"Dialogue: 0,{ass_time(0)},{ass_time(payoff)},Before,,0,0,0,,{{\\fad(120,120)}}{esc(before)}")
     if after:
-        events.append(f"Dialogue: 0,{ass_time(payoff)},{ass_time(total + 5)},After,,0,0,0,,{{\\fad(150,0)}}{esc(after)}")
+        events.append(f"Dialogue: 0,{ass_time(late)},{ass_time(total + 5)},After,,0,0,0,,{{\\fad(150,0)}}{esc(after)}")
     ass = "\n".join([
         "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {w}", f"PlayResY: {h}", "WrapStyle: 0",
         "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
