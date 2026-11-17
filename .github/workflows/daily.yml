@@ -62,7 +62,7 @@ concurrency:
 
 env:
   TZ: Africa/Cairo
-  ROUND: ${{ (inputs.round || contains(fromJSON('["45 13 * * *", "15 14 * * *", "45 17 * * *", "15 18 * * *"]'), github.event.schedule)) && '1' || '' }}
+  ROUND_ASKED: ${{ inputs.round && '1' || '' }}
   OPENSHORTS_COMMIT: 8af4a48a2bdda96c9a02bb8df3f09d4e7ec99e0f
   OPENSHORTS_SERVICES: backend
 
@@ -87,6 +87,22 @@ jobs:
           PRETEND: ${{ inputs.dry_run && inputs.pretend_date || '' }}
         run: |
           log="private/data/logs/daily-$(date +%F).log"
+          # What kind of run is this? A start by hand, by the backup or by the
+          # Google trigger says so itself. A start by GitHub's own timer is judged
+          # by the clock, not by which timer fired: GitHub has fired a morning
+          # timer seven hours late. Before 07:00 nothing runs; from 15:00 on it is
+          # a round if the day's run is done, and the day's run if it is not.
+          ROUND="$ROUND_ASKED"
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            hour=$((10#$(date +%H)))
+            if [ "$hour" -lt 7 ]; then
+              echo "done=true" >> "$GITHUB_OUTPUT"
+              echo "a timer fired at night; nothing to do"
+              exit 0
+            fi
+            if [ "$hour" -ge 15 ] && grep -qx "daily run finished" "$log" 2> /dev/null; then ROUND=1; fi
+          fi
+          echo "round=$ROUND" >> "$GITHUB_OUTPUT"
           if [ -n "$ROUND" ]; then
             # A round runs only between the two dates in the private settings, and
             # not within two and a half hours of a round that finished cleanly.
@@ -168,6 +184,7 @@ jobs:
           CLIP_PRETEND_GAME: ${{ inputs.dry_run && inputs.pretend_game || '' }}
           FORCE: ${{ inputs.force && '1' || '' }}
           CLIPS: ${{ inputs.clips }}
+          ROUND: ${{ steps.guard.outputs.round }}
         run: |
           args=(--quiet)
           [ -n "$ROUND" ] && args+=(--round)
@@ -180,6 +197,7 @@ jobs:
         if: always() && steps.guard.outputs.done != 'true'
         env:
           STATE_BRANCH: ${{ inputs.state_branch || 'main' }}
+          ROUND: ${{ steps.guard.outputs.round }}
         run: |
           [[ "$STATE_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad branch name"; exit 1; }
           cd private
