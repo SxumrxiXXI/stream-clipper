@@ -149,12 +149,13 @@ def overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
 
 
 def moments_for_vod(vod: dict, viewer_clips: list[dict], per_vod: int) -> list[dict]:
+    since = vod.get("scan_from", 0)    # a marathon stream: only its last hours of chat
     try:
-        msgs = chat_spikes.load_messages(chat_spikes.fetch_chat(vod["url"]))
+        msgs = chat_spikes.load_messages(chat_spikes.fetch_chat(vod["url"], since))
     except SystemExit as e:        # no chat replay: fall back to viewer clips alone
         print(f"   {e}", file=sys.stderr)
         msgs = []
-    spikes = [s for s in chat_spikes.detect(msgs, top=per_vod * 3) if not s.vote]
+    spikes = [s for s in chat_spikes.detect(msgs, top=per_vod * 3, since=since) if not s.vote]
     mine = [c for c in viewer_clips if c["vod_id"] == vod["id"]]
     out, used = [], set()
     for s in spikes:
@@ -210,6 +211,7 @@ def scan(a) -> None:
              "viewer_clip_every": int(posting.get("viewer_clip_every", 3)),
              "viewer_clip_min_views": int(posting.get("viewer_clip_min_views", 300)),
              "compare_runs": int(posting.get("compare_runs", 3)),
+             "same_stream_gap": 60 * float(posting.get("same_stream_gap_minutes", 10)),
              "focus_game": featured_today(posting)[0],
              "focus_min_clips": featured_today(posting)[1],
              "focus_phase": featured_today(posting)[2]}
@@ -219,18 +221,20 @@ def scan(a) -> None:
     for n, s in enumerate(streamers):
         progress.report("Scanning streamers", n, len(streamers), s["name"], started_at=t_scan, step_seconds=40)
         vods, clips = recent_vods(s, tw, a.days, a.vods * 3)
-        # Marathon streams have chat logs too large to be worth the wait.
-        long = [v for v in vods if v["seconds"] > a.max_hours * 3600]
-        for v in long:
-            print(f"   skipping {hms(v['seconds'])} stream (over {a.max_hours} h): {v['title'][:50]}")
-        vods = [v for v in vods if v not in long]
+        # A marathon stream's whole chat log is too large to be worth the wait, and
+        # launch days are mostly marathons: read its last hours, the freshest part.
+        # Clips viewers made earlier in it still count as moments of their own.
+        for v in vods:
+            if v["seconds"] > a.max_hours * 3600:
+                v["scan_from"] = v["seconds"] - a.max_hours * 3600
         risky = [v for v in vods if any(w in v["title"].lower() for w in rules["skip_title_words"])]
         for v in risky:
             print(f"   skipping off-brand stream: {v['title'][:60]}")
         vods = [v for v in vods if v not in risky][: a.vods]
         print(f"{s['name']} [{s['status']}]: {len(vods)} streams" + (f", {len(clips)} viewer clips" if tw else ""))
         for v in vods:
-            print(f"   {hms(v['seconds'])}  {v['title'][:70]}")
+            print(f"   {hms(v['seconds'])}  {v['title'][:70]}"
+                  + (f"   (chat read from {hms(v['scan_from'])} on)" if v.get("scan_from") else ""))
             # Which game was on screen at that point of the stream. Twitch labels a
             # whole stream with one category, but every viewer clip carries the
             # category of the moment it was cut from: the nearest clip, within 45
@@ -424,6 +428,7 @@ def scan(a) -> None:
         print(f"\n{rules['focus_game']} ({'launch week: every clip' if rules['focus_phase'] == 'all' else 'its share'}): "
               f"{waiting} of the kept candidates are it; aiming for {target} of today's {want} clips")
     made, per, tournament, ours_made, others_made = 0, defaultdict(int), 0, 0, 0
+    made_at: list[tuple[str, float]] = []      # (stream, seconds in) of today's clips
     tried: set[int] = set()
     while made < want:
         # The best candidate not yet tried that the day's limits still allow. It is
@@ -432,6 +437,9 @@ def scan(a) -> None:
         pick = None
         for idx, (m, spec) in enumerate(order):
             if idx in tried or per[m["streamer"]] >= rules["max_per_streamer"]:
+                continue
+            # Two clips a few minutes apart in one stream are two cuts of one event.
+            if any(u == m["vod_url"] and abs(t - m["burst_start"]) < rules["same_stream_gap"] for u, t in made_at):
                 continue
             feed = any(w in m["streamer"].lower() for w in rules["tournament_words"])
             if feed and tournament >= rules["max_tournament_clips"]:
@@ -458,6 +466,7 @@ def scan(a) -> None:
         if rc == 0:
             made += 1
             per[m["streamer"]] += 1
+            made_at.append((m["vod_url"], m["burst_start"]))
             tournament += 1 if feed else 0
             ours_made += 1 if confirmed(m) else 0
             others_made += 0 if confirmed(m) else 1
@@ -577,7 +586,7 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=7, help="how far back to look (default 7)")
     ap.add_argument("--vods", type=int, default=2, help="streams per streamer (default 2)")
     ap.add_argument("--per-vod", type=int, default=5, help="moments kept per stream (default 5)")
-    ap.add_argument("--max-hours", type=float, default=8, help="skip streams longer than this (default 8)")
+    ap.add_argument("--max-hours", type=float, default=8, help="of a longer stream, read only this many hours of chat, the last ones (default 8)")
     ap.add_argument("--make", type=int, default=0, help="clip the top N moments (approved streamers only)")
     ap.add_argument("--streamer", help="only this name from the list")
     sub = ap.add_subparsers(dest="cmd")

@@ -103,16 +103,24 @@ def downloader() -> str:
              "https://github.com/lay295/TwitchDownloader/releases in tools/TwitchDownloaderCLI")
 
 
-def fetch_chat(url: str) -> Path:
-    """Download the chat replay once; later calls reuse the file on disk."""
+def fetch_chat(url: str, since: float = 0) -> Path:
+    """Download the chat replay once; later calls reuse the file on disk.
+
+    `since` (seconds into the stream, Twitch only) fetches chat from that point
+    on, so a marathon stream costs no more than its last hours. Message times
+    stay counted from the start of the stream.
+    """
     platform, vid = source_of(url)
     CHAT_DIR.mkdir(parents=True, exist_ok=True)
     if platform == "twitch":
-        path = CHAT_DIR / f"{vid}.json"
+        since = int(max(0, since))
+        path = CHAT_DIR / (f"{vid}_from{since}.json" if since else f"{vid}.json")
         if path.exists() and path.stat().st_size > 2:
             return path
         tmp = path.with_suffix(".part.json")
         cmd = [downloader(), "chatdownload", "--id", vid, "-o", str(tmp), "--collision", "Overwrite"]
+        if since:
+            cmd += ["-b", f"{since}s"]
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         except subprocess.TimeoutExpired:
@@ -185,9 +193,13 @@ def load_messages(path: Path) -> list[tuple[float, str, str]]:
 
 
 def detect(msgs: list[tuple[float, str, str]], *, min_z: float = MIN_Z, lead: int = LEAD,
-           tail: int = TAIL, top: int | None = None) -> list[Spike]:
+           tail: int = TAIL, top: int | None = None, since: float = 0) -> list[Spike]:
+    """`since`: the chat starts this many seconds into the stream (see fetch_chat).
+    Nothing before it counts towards the baseline, and the first minute after it
+    is left out, as the first minutes of a whole stream are."""
     if not msgs:
         return []
+    lo = int(max(0, since) // BUCKET)
     n = int(msgs[-1][0] // BUCKET) + 1
     counts = [0] * n
     people: list[set] = [set() for _ in range(n)]
@@ -205,8 +217,8 @@ def detect(msgs: list[tuple[float, str, str]], *, min_z: float = MIN_Z, lead: in
     half = BASELINE_SPAN // BUCKET
     z = [0.0] * n
     base = [0.0] * n
-    for i in range(n):
-        window = signal[max(0, i - half): i + half + 1]
+    for i in range(lo, n):
+        window = signal[max(lo, i - half): i + half + 1]
         med = statistics.median(window)
         mad = statistics.median(abs(x - med) for x in window)
         spread = max(1.4826 * mad, math.sqrt(med + 1), 1.0)   # floor: Poisson noise
@@ -216,7 +228,7 @@ def detect(msgs: list[tuple[float, str, str]], *, min_z: float = MIN_Z, lead: in
     # Runs of buckets above the threshold, merged when close together.
     runs: list[list[int]] = []
     for i in range(n):
-        if i * BUCKET < EDGE_START or i * BUCKET > msgs[-1][0] - EDGE_END:
+        if i * BUCKET < (since + 60 if since else EDGE_START) or i * BUCKET > msgs[-1][0] - EDGE_END:
             continue
         if z[i] >= min_z and signal[i] >= MIN_CHATTERS:
             if runs and (i - runs[-1][1]) * BUCKET <= MERGE_GAP + BUCKET:
