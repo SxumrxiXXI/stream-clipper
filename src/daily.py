@@ -3,6 +3,7 @@
 
     .venv/bin/python src/daily.py            # run it now
     .venv/bin/python src/daily.py --no-discover   # skip the hunt for new streamers
+    .venv/bin/python src/daily.py --round         # a short round between daily runs
 
 1. Discover: which categories and streamers are hot on Twitch right now. New
    names land on the automatic watchlist as `watching` (never clipped until you
@@ -17,6 +18,11 @@
 6. Clean up: delete clip folders that are posted and live, and old working
    files (src/cleanup.py).
 
+A round (--round) is the short version for busy weeks: it looks only at the
+last few hours, makes one clip, and puts it in the next posting slot in place
+of the older clip that held it. Rounds run only between `rounds_start` and
+`rounds_until` in config/posting.yaml.
+
 Everything is logged to data/logs/daily-<date>.log.
 """
 from __future__ import annotations
@@ -26,6 +32,7 @@ import datetime as dt
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -60,9 +67,53 @@ def step(log, title: str, cmd: list[str]) -> int:
     return rc
 
 
+def run_round(a, cfg: dict, log_path: Path) -> None:
+    """One short round: the freshest good moment of the last hours, into the next slot."""
+    now = dt.datetime.now()
+    today = os.environ.get("CLIP_PRETEND_DATE") or dt.date.today().isoformat()
+    start, until = str(cfg.get("rounds_start") or ""), str(cfg.get("rounds_until") or "")
+    if not a.force and not (start and start <= today <= (until or start)):
+        print(f"rounds are not switched on for {today} (rounds_start / rounds_until in config/posting.yaml)")
+        sys.exit(0)
+    # GitHub's timer and the backup on the owner's machine may both start a round:
+    # the second one finds the first one's clean finish and stops.
+    done = re.findall(r"^round finished (\S+)$", log_path.read_text(), re.M) if log_path.exists() else []
+    if done and not a.force and now - dt.datetime.fromisoformat(done[-1]) < dt.timedelta(minutes=150):
+        print(f"a round already finished at {done[-1][11:]}; not running another so soon")
+        sys.exit(0)
+    hours = str(cfg.get("round_hours", 6))
+    scan, post = str(ROOT / "src" / "scan.py"), str(ROOT / "src" / "publish" / "post.py")
+    with open(log_path, "a") as log:
+        failed = []
+        if not a.no_discover and step(log, "round 1/4 discover", [PY, "-u", scan, "--days", "1", "discover", "--add", "10"]):
+            failed.append("discover")
+        if step(log, f"round 2/4 scan the last {hours} hours and make one clip",
+                [PY, "-u", scan, "--days", "2", "--vods", "1", "--since-hours", hours,
+                 "--make", str(a.clips or 1), "--allow-none"]):
+            failed.append("scan")
+        step(log, "round 3/4 give it the next slot", [PY, post, "plan", "--round"])
+        if cfg.get("auto_post"):
+            if step(log, "round 4/4 send to the platforms", [PY, post, "send"]):
+                failed.append("send")
+            step(log, "one clip per slot", [PY, post, "settle"])
+            if step(log, "did earlier posts go out", [PY, post, "check"]):
+                failed.append("posts")
+        else:
+            step(log, "round 4/4 send (auto_post is off: showing what would go out)", [PY, post, "send"])
+            step(log, "one clip per slot", [PY, post, "settle"])
+        step(log, "free disk space", [PY, str(ROOT / "src" / "cleanup.py")])
+        summary = f"round finished {dt.datetime.now():%Y-%m-%dT%H:%M}" + (
+            f" with problems in: {', '.join(failed)}" if failed else "")
+        print(f"\n{summary}")
+        log.write(f"\n{summary}\n")
+    sys.exit(1 if failed else 0)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--no-discover", action="store_true")
+    ap.add_argument("--round", action="store_true",
+                    help="a short round: one clip from the last few hours, into the next slot")
     ap.add_argument("--clips", type=int, help="clips to make (default: clips_per_day in config/posting.yaml)")
     ap.add_argument("--force", action="store_true", help="run even if today's run already finished")
     ap.add_argument("--quiet", action="store_true",
@@ -84,12 +135,15 @@ def main() -> None:
     today_log = ROOT / "data" / "logs" / f"daily-{dt.date.today()}.log"
     # Only a clean finish counts: after a run that ended "with problems" the day
     # can simply be started again.
-    if not a.force and today_log.exists() and "daily run finished" in today_log.read_text().splitlines():
+    if not a.round and not a.force and today_log.exists() and "daily run finished" in today_log.read_text().splitlines():
         sys.exit("today's run already finished (use --force to run again)")
 
     cfg = yaml.safe_load((ROOT / "config" / "posting.yaml").read_text())
     if os.environ.get("CLIP_DRY_RUN"):       # a trial: make and plan, send nothing
         cfg["auto_post"] = False
+    if a.round:
+        (ROOT / "data" / "logs").mkdir(parents=True, exist_ok=True)
+        run_round(a, cfg, today_log)
     n = a.clips or cfg.get("clips_per_day", 4)
     logs = ROOT / "data" / "logs"
     logs.mkdir(parents=True, exist_ok=True)

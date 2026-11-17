@@ -7,7 +7,10 @@ still runs on GitHub; this machine only has to be awake for a few seconds.
 
 It starts
 - the daily run, if it is past 10:25 and today's run has neither finished nor
-  is under way, and
+  is under way,
+- a round (the short run between daily runs), on the days the settings switch
+  rounds on, if its time passed 5 to 60 minutes ago and GitHub has not started
+  one since, and
 - the post check, if a clip's slot passed more than ten minutes ago, nothing
   has confirmed it yet, and no check has started in the last 40 minutes.
 
@@ -61,7 +64,8 @@ def main() -> None:
         say("not signed in to GitHub (or offline); nothing done")
         return
     public, private = f"{owner}/stream-clipper", f"{owner}/stream-clipper-private"
-    tz = ZoneInfo(yaml.safe_load((ROOT / "config" / "posting.yaml").read_text())["timezone"])
+    cfg = yaml.safe_load((ROOT / "config" / "posting.yaml").read_text())
+    tz = ZoneInfo(cfg["timezone"])
     now = dt.datetime.now(tz)
     if "--at" in sys.argv:                     # for testing: pretend it is this time
         now = dt.datetime.fromisoformat(sys.argv[sys.argv.index("--at") + 1]).replace(tzinfo=tz)
@@ -90,6 +94,28 @@ def main() -> None:
                    "-f", "dry_run=false", "-f", "force=false", "-f", "state_branch=main")
                 stamp.parent.mkdir(parents=True, exist_ok=True)
                 stamp.write_text(str(tries + 1))
+
+    # ---- rounds --------------------------------------------------------------
+    start, until = str(cfg.get("rounds_start") or ""), str(cfg.get("rounds_until") or "")
+    if start and start <= f"{now:%Y-%m-%d}" <= (until or start):
+        for text in cfg.get("round_times") or []:
+            due_at = dt.datetime.combine(now.date(), dt.time.fromisoformat(str(text)), tz)
+            if not dt.timedelta(minutes=5) <= now - due_at < dt.timedelta(minutes=60):
+                continue
+            # Any run of the workflow on main since shortly before the round's time
+            # counts: GitHub's own start, or one made from here earlier.
+            since = any(r.get("headBranch") == "main" and
+                        dt.datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00")) > due_at - dt.timedelta(minutes=10)
+                        for r in daily)
+            stamp = Path.home() / "Library" / "Caches" / "stream-clipper-backup" / f"round-{due_at:%Y-%m-%d-%H%M}"
+            if since or under_way or stamp.exists():
+                continue
+            say(f"GitHub has not started the {due_at:%H:%M} round: starting it" + (" (dry run, not started)" if DRY else ""))
+            if not DRY:
+                gh("workflow", "run", "daily.yml", "-R", public, "--ref", "main",
+                   "-f", "round=true", "-f", "dry_run=false", "-f", "force=false", "-f", "state_branch=main")
+                stamp.parent.mkdir(parents=True, exist_ok=True)
+                stamp.write_text("started")
 
     # ---- the post check -----------------------------------------------------
     try:

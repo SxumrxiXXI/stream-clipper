@@ -144,6 +144,18 @@ def recent_vods(s: dict, tw: Twitch | None, days: int, limit: int) -> tuple[list
     return vods, clips
 
 
+def NOW() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def started_at(vod: dict) -> dt.datetime | None:
+    """When the stream began (Twitch gives it; a YouTube listing does not)."""
+    try:
+        return dt.datetime.fromisoformat(str(vod["created_at"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError):
+        return None
+
+
 def overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
     return a0 < b1 and b0 < a1
 
@@ -232,6 +244,23 @@ def scan(a) -> None:
         for v in vods:
             if v["seconds"] > a.max_hours * 3600:
                 v["scan_from"] = v["seconds"] - a.max_hours * 3600
+        # A round between daily runs only wants what happened in the last hours:
+        # streams that ended before that are left out, and of the others only the
+        # recent part is read (plus ten minutes for chat's baseline to settle).
+        if a.since_hours:
+            fresh = []
+            for v in vods:
+                born = started_at(v)
+                if born is None:
+                    continue                   # no start time (YouTube listing): cannot place it in time
+                first = (NOW() - dt.timedelta(hours=a.since_hours) - born).total_seconds()
+                if first >= v["seconds"]:
+                    continue                   # it ended before the window opened
+                if first > 0:
+                    v["moments_from"] = first
+                    v["scan_from"] = max(v.get("scan_from", 0), first - 600)
+                fresh.append(v)
+            vods = fresh
         risky = [v for v in vods if any(w in v["title"].lower() for w in rules["skip_title_words"])]
         for v in risky:
             print(f"   skipping off-brand stream: {v['title'][:60]}")
@@ -246,11 +275,17 @@ def scan(a) -> None:
             # minutes, tells us. Otherwise the streamer's usual game is the guess.
             here = [c for c in clips if c["vod_id"] == v["id"] and c.get("game_id")]
             names = tw.game_names([c["game_id"] for c in here]) if tw and here else {}
+            born = started_at(v)
             for m in moments_for_vod(v, clips, a.per_vod):
+                if m["burst_start"] < v.get("moments_from", 0):
+                    continue
                 near = min(here, key=lambda c: abs(c["offset"] - m["burst_start"]), default=None)
                 seen = names.get(near["game_id"], "") if near and abs(near["offset"] - m["burst_start"]) <= 2700 else ""
                 found.append({**m, "streamer": s["name"], "status": s["status"],
                               "stream_seconds": v["seconds"],
+                              # When it happened, so a post's age can be compared with its views.
+                              "happened": (born + dt.timedelta(seconds=m["burst_start"])).isoformat(timespec="seconds")
+                                          if born else None,
                               "game": seen or (s.get("games") or [""])[0],
                               "game_from": "a viewer clip nearby" if seen else "the streamer's usual game",
                               "credit": s.get("credit", s["name"]), "permission": s.get("permission", ""),
@@ -486,7 +521,9 @@ def scan(a) -> None:
     print(f"\nmade {made} of {want} clips (judged {looked} candidates, {len(kept)} passed)")
     progress.report("Finding the best moments", total, total, f"{made} clips made from {looked} candidates",
                     started_at=t0, finished=True)
-    if looked and not made:
+    if looked and not made and a.allow_none:
+        print("no clip came out of this round; the clips already scheduled stay as they are")
+    elif looked and not made:
         # Candidates existed and not one clip came out: something is broken (a
         # key, the clipper), not just a quiet day. Fail loudly so the run is
         # marked failed and its owner hears about it.
@@ -594,6 +631,10 @@ def main() -> None:
     ap.add_argument("--per-vod", type=int, default=5, help="moments kept per stream (default 5)")
     ap.add_argument("--max-hours", type=float, default=8, help="of a longer stream, read only this many hours of chat, the last ones (default 8)")
     ap.add_argument("--make", type=int, default=0, help="clip the top N moments (approved streamers only)")
+    ap.add_argument("--since-hours", type=float, default=0,
+                    help="only moments that happened in the last N hours (Twitch only)")
+    ap.add_argument("--allow-none", action="store_true",
+                    help="with --make: making no clip is not an error (a round between daily runs)")
     ap.add_argument("--streamer", help="only this name from the list")
     sub = ap.add_subparsers(dest="cmd")
     for name, text in (("discover", "find streamers from engagement (needs Twitch credentials)"),
