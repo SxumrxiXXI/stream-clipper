@@ -371,6 +371,7 @@ def judge_moment(window: Path, moment: dict, args) -> dict | None:
     try:
         v = judge.judge(
             window, dur, burst=float(moment["burst_start"]) - ws,
+            peak=float(moment.get("peak") or moment["burst_start"]) - ws,
             chat=[(t - ws, text) for t, text in moment.get("chat") or []],
             streamer=args.streamer, game=args.game, title=moment.get("vod_title", ""),
             kind=moment.get("kind", ""),

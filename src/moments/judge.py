@@ -174,11 +174,14 @@ def api_key() -> tuple[str, str]:
 
 
 def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float, str]],
+          peak: float | None = None,
           streamer: str = "", game: str = "", title: str = "", kind: str = "",
           viewer_clips: list[tuple[float, str, int]] | None = None) -> dict:
     """-> the verdict as a dict, plus `keep`, `cost_usd` and `model`.
 
     `chat` and `viewer_clips` use seconds relative to the start of `video`.
+    `burst` is where chat's reaction began and `peak` where it was strongest;
+    a long reaction can peak half a minute after it began.
     Raises on API errors; the caller decides what to do without a verdict.
     """
     key, model = api_key()
@@ -223,21 +226,24 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
         except Exception:
             pass
 
-    # The model's timestamps are trusted only when they hang together: inside
-    # the video, payoff inside the cut, and the cut on the stretch chat reacted
-    # to. Otherwise the cut is anchored on the chat reaction instead.
+    # The hook, the caption and the title describe the moment the judge saw, so
+    # the clip has to be cut where the judge put it. Its times are used whenever
+    # they hang together (inside the video, long enough, payoff inside the cut),
+    # also when they sit away from where chat's reaction began: a long reaction
+    # peaks later, and on 17 Nov a clip cut at the start of chat's reaction
+    # ended before the moment its own hook promised. Times that do not hang
+    # together mean the moment cannot be placed, and no clip is made from a guess.
     try:
         start, end, payoff = to_seconds(v["start"]), to_seconds(v["end"]), to_seconds(v["payoff_at"])
-        sane = (0 <= start < end <= duration + 1 and start - 1 <= payoff <= end + 1
-                and start <= burst + 12 and end >= burst - 25)
+        placed = 0 <= start < end <= duration + 1 and end - start >= 5 and start - 1 <= payoff <= end + 1
     except (ValueError, TypeError):
         start = end = payoff = 0.0
-        sane = False
-    v["cut_from"] = "judge"
-    if not sane:
-        # Chat erupts a few seconds after the moment: keep the lead-up and the reaction.
-        start, end, payoff = burst - 18, burst + 6, burst - 5
-        v["cut_from"] = "chat reaction (the judge's times did not add up)"
+        placed = False
+    late = max(burst, peak if peak is not None else burst)
+    v["cut_from"] = "judge" if start <= late + 12 and end >= burst - 25 else "judge, away from chat's reaction"
+    if not placed:
+        start, end, payoff = burst - 18, burst + 6, burst - 5      # only so the log shows something
+        v["cut_from"] = "nowhere (the judge's times did not add up)"
     start = max(0.0, min(start, duration - MIN_SECONDS))
     end = max(start + MIN_SECONDS, min(end, duration))
     if end - start > MAX_SECONDS:
@@ -271,6 +277,8 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
         reasons.append("needs earlier context")
     if v["overall"] < KEEP_OVERALL or v["standalone"] < KEEP_STANDALONE:
         reasons.append("scored too low")
+    if not placed:
+        reasons.append("the judge could not say where in the video the moment is")
     v["rejected_because"] = reasons
     v["keep"] = not reasons
     # One number to rank accepted clips by: payoff and opening matter most for retention.
