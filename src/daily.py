@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
+import json
 import os
 import subprocess
 import sys
@@ -98,10 +99,23 @@ def main() -> None:
         failed = []
         if not a.no_discover:
             # Who is being clipped most in the last day, not the last week.
-            if step(log, "1/5 discover", [PY, "-u", scan, "discover", "--days", "1", "--add", "10"]):
+            if step(log, "1/5 discover", [PY, "-u", scan, "--days", "1", "discover", "--add", "10"]):
                 failed.append("discover")
+        # A day that is started a second time (after a run that ended with problems)
+        # only makes what is still missing, never a second set of clips.
+        today = dt.date.today().isoformat()
+        try:
+            made = sum(1 for i in json.loads((ROOT / "data" / "queue.json").read_text())
+                       if str(i.get("created", ""))[:10] == today and i.get("status") != "skipped")
+        except (OSError, ValueError):
+            made = 0
+        left = max(0, n - made)
+        if not left:
+            note = f"\n===== 2/5 today's {made} clips were already made; not making more ====="
+            print(note, flush=True)
+            log.write(note + "\n")
         # Only streams from the last two days (a stream that ran overnight counts as today's).
-        if step(log, "2/5 scan and make clips", [PY, "-u", scan, "--days", "2", "--vods", "1", "--make", str(n)]):
+        elif step(log, "2/5 scan and make clips", [PY, "-u", scan, "--days", "2", "--vods", "1", "--make", str(left)]):
             failed.append("scan")
         step(log, "3/5 plan the queue", [PY, post, "plan"])
         if cfg.get("auto_post"):

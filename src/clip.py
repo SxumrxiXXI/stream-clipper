@@ -182,10 +182,17 @@ def fetch_window(url: str, start: float, end: float) -> Path:
     out = WINDOWS / f"{stem}_{int(start)}-{int(end)}.mp4"
     if out.exists() and out.stat().st_size > 100_000:
         return out
-    cmd = ["yt-dlp", "--no-warnings", "-q", "--download-sections", f"*{int(start)}-{int(end)}",
+    cmd = ["yt-dlp", "--no-warnings", "-q", "--socket-timeout", "30", "--retries", "3",
+           "--download-sections", f"*{int(start)}-{int(end)}",
            "--force-keyframes-at-cuts", "-f", "best[height<=1080]/best", "--merge-output-format", "mp4",
            "-o", str(out), url]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        # A stalled download once held a run up for two hours. Ninety seconds of
+        # video should take two or three minutes; give it eight, then give up.
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=480)
+    except subprocess.TimeoutExpired:
+        out.unlink(missing_ok=True)
+        die("could not download that stretch of the stream: it stalled for 8 minutes")
     if res.returncode != 0 or not out.exists():
         die(f"could not download that stretch of the stream: {res.stderr.strip()[-300:]}")
     return out
