@@ -109,7 +109,7 @@ def main() -> None:
                        if str(i.get("created", ""))[:10] == today and i.get("status") != "skipped")
         except (OSError, ValueError):
             made = 0
-        left = max(0, n - made)
+        left = n if a.force else max(0, n - made)        # --force: run the whole day again
         if not left:
             note = f"\n===== 2/5 today's {made} clips were already made; not making more ====="
             print(note, flush=True)

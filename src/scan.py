@@ -53,7 +53,8 @@ def featured_today(posting: dict, today: dt.date | None = None) -> tuple[str, in
     game = str(posting.get("focus_game") or "").strip().lower()
     if not game:
         return "", 0, "off"
-    today = today or dt.date.today()
+    pretend = os.environ.get("CLIP_PRETEND_DATE", "")           # rehearsals only
+    today = today or (dt.date.fromisoformat(pretend) if pretend else dt.date.today())
     start = posting.get("focus_start")
     if start:
         start = start if isinstance(start, dt.date) else dt.date.fromisoformat(str(start))

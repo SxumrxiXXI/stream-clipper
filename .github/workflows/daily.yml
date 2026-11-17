@@ -29,6 +29,9 @@ on:
       state_branch:
         description: "Branch of the private repository to save the records to"
         default: "main"
+      pretend_date:
+        description: "Rehearse the featured-game schedule as if it were this date, YYYY-MM-DD (only with dry_run)"
+        default: ""
       simulate:
         description: "Fault to rehearse (only with dry_run)"
         type: choice
@@ -128,6 +131,7 @@ jobs:
         if: steps.guard.outputs.done != 'true'
         env:
           CLIP_DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '' }}
+          CLIP_PRETEND_DATE: ${{ inputs.dry_run && inputs.pretend_date || '' }}
           FORCE: ${{ inputs.force && '1' || '' }}
           CLIPS: ${{ inputs.clips }}
         run: |

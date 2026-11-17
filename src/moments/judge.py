@@ -44,6 +44,7 @@ class Verdict(BaseModel):
     event_happened: bool        # a discrete thing occurs (a play, a fail, a joke landing, an outburst)
     chat_was_prompted: bool     # chat is typing because it was asked to (vote, answer, mini-game, giveaway)
     needs_earlier_context: bool
+    watching_a_video: bool      # the stream is showing someone else's video or clip, and that is the moment
     reaction_in_clip: bool      # the streamer, casters or crowd audibly or visibly react
     has_clear_moment: bool
     start: str                  # "MM:SS" in the video; the model is steadier with clock times
@@ -92,6 +93,9 @@ Watch and listen to the whole video, then decide.
      a giveaway, an emote the stream told them to spam? If chat is answering or playing
      along rather than reacting to something that just happened, answer true.
    - needs_earlier_context: would a stranger need to have seen earlier parts of the stream?
+   - watching_a_video: is the thing being reacted to a video, clip or post by someone else
+     that the streamer is playing in a browser or player (a reaction to other people's
+     content)? Gameplay, the streamer's own camera and a tournament broadcast are not this.
    - reaction_in_clip: can you hear or see the streamer, casters or a crowd react?
 
 1. has_clear_moment: true only if ONE specific thing happens that chat is reacting to and that
@@ -269,6 +273,10 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
     v["game_label_ok"] = bool(v.get("game_label_ok", True))
     # The yes/no facts gate the clip; the scores only rank what passes.
     reasons = []
+    if v.get("watching_a_video"):
+        # A clip of someone watching a clip is other people's footage twice over,
+        # and mostly shows a browser window.
+        reasons.append("the streamer is watching someone else's video")
     if not v["has_clear_moment"] or v["moment_type"] == "none":
         reasons.append("no clear moment")
     if not v["event_happened"]:
