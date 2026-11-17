@@ -155,7 +155,11 @@ def moments_for_vod(vod: dict, viewer_clips: list[dict], per_vod: int) -> list[d
     except SystemExit as e:        # no chat replay: fall back to viewer clips alone
         print(f"   {e}", file=sys.stderr)
         msgs = []
-    spikes = [s for s in chat_spikes.detect(msgs, top=per_vod * 3, since=since) if not s.vote]
+    every = [s for s in chat_spikes.detect(msgs, since=since) if not s.vote]
+    spikes = every[: per_vod * 3]
+    # The reaction more people joined than any other in the stream: a fact the
+    # page can state. Not claimed when only part of the stream's chat was read.
+    most = max((s.chatters for s in every), default=0) if not since else 0
     mine = [c for c in viewer_clips if c["vod_id"] == vod["id"]]
     out, used = [], set()
     for s in spikes:
@@ -166,6 +170,7 @@ def moments_for_vod(vod: dict, viewer_clips: list[dict], per_vod: int) -> list[d
         out.append({
             "start": s.start, "end": s.end, "peak": s.peak, "burst_start": s.burst_start,
             "kind": s.kind, "chatters": s.chatters, "chat_ratio": s.ratio,
+            "stream_peak": bool(most) and s.chatters == most,
             "viewer_clips": len(hits), "viewer_clip_views": views, "sample": s.sample[:3],
             "chat": s.chat or [],
             "clips": [[mine[i]["offset"], mine[i]["title"], mine[i]["views"]] for i in hits],
@@ -245,6 +250,7 @@ def scan(a) -> None:
                 near = min(here, key=lambda c: abs(c["offset"] - m["burst_start"]), default=None)
                 seen = names.get(near["game_id"], "") if near and abs(near["offset"] - m["burst_start"]) <= 2700 else ""
                 found.append({**m, "streamer": s["name"], "status": s["status"],
+                              "stream_seconds": v["seconds"],
                               "game": seen or (s.get("games") or [""])[0],
                               "game_from": "a viewer clip nearby" if seen else "the streamer's usual game",
                               "credit": s.get("credit", s["name"]), "permission": s.get("permission", ""),
