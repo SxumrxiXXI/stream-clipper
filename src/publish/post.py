@@ -158,6 +158,76 @@ def plan_fresh(cfg: dict, items: list[dict], now: dt.datetime) -> tuple[list[dic
     return placed, changes
 
 
+def plan_round(cfg: dict, items: list[dict], now: dt.datetime) -> list[dict]:
+    """A round between daily runs: its clip takes the next slot, whoever holds it.
+
+    Nothing already scheduled is touched here. The clip that held the slot is
+    withdrawn by `settle`, and only once the new one is safely at Upload-Post.
+    """
+    tz = ZoneInfo(cfg["timezone"])
+    soon = now + dt.timedelta(minutes=30)
+    times = sorted(dt.time.fromisoformat(x) for x in cfg["slots"])
+    slots, day = [], now.date()
+    while len(slots) < len(times) * 2:
+        slots += [w for w in (dt.datetime.combine(day, t, tz) for t in times) if w >= soon]
+        day += dt.timedelta(days=1)
+    placed = []
+    for item in by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"]]):
+        item["scheduled_for"] = slots.pop(0).isoformat()
+        dress(item, items)
+        placed.append(item)
+    return placed
+
+
+def settle(cfg: dict, items: list[dict], really: bool) -> None:
+    """One clip per slot. Where a round put a newer clip into a slot that an
+    older one held, the older one is withdrawn from Upload-Post, provided the
+    newer one was handed over. A round's clip that could not be handed over is
+    dropped instead, and the older clip keeps its slot."""
+    api = None
+    by_slot: dict[str, list[dict]] = {}
+    for i in items:
+        if i.get("scheduled_for") and i["status"] in ("ready", "scheduled"):
+            by_slot.setdefault(i["scheduled_for"], []).append(i)
+    for slot, group in sorted(by_slot.items()):
+        if len(group) < 2:
+            continue
+        when = dt.datetime.fromisoformat(slot).strftime("%a %d %b %H:%M")
+        group.sort(key=lambda i: str(i.get("created", "")))
+        newest = group[-1]
+        if newest["status"] == "ready":
+            if really:                         # it never reached Upload-Post: the older clip stays
+                newest["status"], newest["scheduled_for"] = "skipped", None
+                newest["note"] = "made in a round but could not be handed to Upload-Post"
+                print(f"DROPPED  {newest['id']}  {when}  (could not be sent; the clip already there stays)")
+            else:
+                for old in group[:-1]:
+                    print(f"would withdraw  {old['id']}  {when}  ({newest['id']} is fresher)")
+            continue
+        for old in group[:-1]:
+            job = (old.get("response") or {}).get("job_id")
+            print(f"{'WITHDRAW' if really else 'would withdraw'}  {old['id']}  {when}  ({newest['id']} is fresher)")
+            if not really:
+                continue
+            try:
+                if old["status"] == "scheduled" and job:
+                    api = api or client()
+                    api.cancel_scheduled(job)
+                old["status"], old["scheduled_for"] = "skipped", None
+                old["note"] = f"withdrawn: {newest['id']}, made in a later round, took its slot"
+            except Exception as e:
+                # Two clips in one slot would both go out: take the new one back instead.
+                print(f"      could not withdraw it ({str(e)[:160]}); withdrawing {newest['id']} instead")
+                try:
+                    api.cancel_scheduled((newest.get("response") or {}).get("job_id"))
+                    newest["status"], newest["scheduled_for"] = "skipped", None
+                    newest["note"] = "withdrawn: the clip it was to replace could not be withdrawn"
+                except Exception as e2:
+                    print(f"      could not withdraw that either ({str(e2)[:160]}): TWO CLIPS ARE SCHEDULED FOR {when}")
+        save(items)
+    save(items)
+
+
 def apply_changes(cfg: dict, items: list[dict], changes: list[tuple], really: bool) -> None:
     """Carry out plan_fresh's moves and withdrawals at Upload-Post (or only print them)."""
     api = client() if really and changes else None
@@ -616,6 +686,16 @@ def report(items: list[dict]) -> None:
     table("found by", lambda i: i.get("found_by") or "not recorded")
     table("the day's pick", lambda i: {1: "1st", 2: "2nd", 3: "3rd"}.get(i.get("pick"), "not recorded"))
     table("format", lambda i: i.get("format") or "classic")
+
+    def age(i: dict) -> str:
+        """How old the moment was when the clip went out."""
+        try:
+            hours = (dt.datetime.fromisoformat(i["scheduled_for"])
+                     - dt.datetime.fromisoformat(i["happened"])).total_seconds() / 3600
+        except (KeyError, TypeError, ValueError):
+            return "not recorded"
+        return "under 6 h" if hours < 6 else "6 to 12 h" if hours < 12 else "12 to 24 h" if hours < 24 else "over a day"
+    table("age when posted", age)
     table("caption style", lambda i: i.get("style", "long"))
     table("Instagram hashtags", lambda i: "none" if i.get("ig_tags") is False else "with tags")
     table("game", lambda i: i.get("game") or "?")
@@ -648,7 +728,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
-    sub.add_parser("plan")
+    k = sub.add_parser("plan")
+    k.add_argument("--round", action="store_true",
+                   help="a round between daily runs: the new clip takes the next slot, whoever holds it")
+    sub.add_parser("settle", help="after a round's send: withdraw the older clip from a slot that now has two")
     s = sub.add_parser("send")
     s.add_argument("--yes", action="store_true", help="really post, for this run, even if auto_post is false")
     s.add_argument("--only", help="send just this clip id")
@@ -668,6 +751,14 @@ def main() -> None:
     cfg, items = config(), load()
     if a.cmd == "list":
         show(items)
+    elif a.cmd == "settle":
+        settle(cfg, items, really=bool(cfg.get("auto_post")))
+    elif a.cmd == "plan" and a.round:
+        placed = plan_round(cfg, items, dt.datetime.now(ZoneInfo(cfg["timezone"])))
+        save(items)
+        print(f"placed {len(placed)} clips")
+        for i in placed:
+            print(f"   {i['id']}  {dt.datetime.fromisoformat(i['scheduled_for']):%a %d %b %H:%M}  {i.get('streamer', '')}")
     elif a.cmd == "plan":
         if cfg.get("fresh_first"):
             now = dt.datetime.now(ZoneInfo(cfg["timezone"]))

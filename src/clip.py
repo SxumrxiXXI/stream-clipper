@@ -275,7 +275,7 @@ SLURS = re.compile(r"\b(retard\w*|fag(got)?s?|nigg\w*|trann(y|ies)|kikes?|chinks
 # page's name: platforms hold swearing and sensitive subjects in on-screen text
 # against a post.
 QUOTE_BLOCK = re.compile(
-    r"\b(fuck\w*|shit\w*|bitch\w*|cunt\w*|dick\w*|cock\w*|puss\w*|ass(hole)?s?|bastard\w*|whore\w*|slut\w*|"
+    r"\b(\w*fuck\w*|\w*shit\w*|bitch\w*|cunt\w*|dick\w*|cock\w*|puss\w*|ass(hole)?s?|bastard\w*|whore\w*|slut\w*|"
     r"retard\w*|fag\w*|nigg\w*|rape\w*|rapist\w*|suicid\w*|kill (yo)?urself|kys|nazi\w*|hitler|autis\w*|"
     r"cancer|porn\w*|sex\w*|naked|nude\w*|drug\w*|cocaine|heroin|terroris\w*|shoot up|bomb\w*)\b", re.I)
 
@@ -840,7 +840,8 @@ def main() -> None:
             "format": fmt,
             **({"found_by": ("viewer clip" if not moment.get("chatters") else
                              "chat + viewer clip" if moment.get("viewer_clips") else "chat"),
-                "pick": moment.get("pick"), "compare": moment.get("compare")} if moment else {}),
+                "pick": moment.get("pick"), "compare": moment.get("compare"),
+                "happened": moment.get("happened")} if moment else {}),
             "hook": hook, "score": args.score or float(c.get("predicted_score") or 0),
             "seconds": round(float(c.get("end", 0)) - float(c.get("start", 0)), 1),
             "captions": {"tiktok": tt, "instagram": ig,

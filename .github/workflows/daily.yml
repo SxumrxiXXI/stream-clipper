@@ -13,8 +13,19 @@ on:
     - cron: "17 7 * * *"          # 09:17 in Cairo (winter time)
     - cron: "47 8 * * *"          # 10:47
     - cron: "17 10 * * *"         # 12:17
+    # Rounds: a short run that makes one clip from the last few hours for the next
+    # posting slot. Two chances each; outside the dates in the private settings
+    # (rounds_start / rounds_until) these stop in seconds.
+    - cron: "45 13 * * *"         # 15:45 in Cairo, for the 18:00 slot
+    - cron: "15 14 * * *"         # 16:15
+    - cron: "45 17 * * *"         # 19:45, for the 22:00 slot
+    - cron: "15 18 * * *"         # 20:15
   workflow_dispatch:
     inputs:
+      round:
+        description: "A short round (one clip from the last few hours) instead of the daily run"
+        type: boolean
+        default: false
       dry_run:
         description: "Make and plan clips but send nothing"
         type: boolean
@@ -48,6 +59,7 @@ concurrency:
 
 env:
   TZ: Africa/Cairo
+  ROUND: ${{ (inputs.round || contains(fromJSON('["45 13 * * *", "15 14 * * *", "45 17 * * *", "15 18 * * *"]'), github.event.schedule)) && '1' || '' }}
   OPENSHORTS_COMMIT: 8af4a48a2bdda96c9a02bb8df3f09d4e7ec99e0f
   OPENSHORTS_SERVICES: backend
 
@@ -69,8 +81,26 @@ jobs:
         id: guard
         env:
           FORCE: ${{ inputs.force && '1' || '' }}
+          PRETEND: ${{ inputs.dry_run && inputs.pretend_date || '' }}
         run: |
-          if [ -z "$FORCE" ] && grep -qx "daily run finished" "private/data/logs/daily-$(date +%F).log" 2> /dev/null; then
+          log="private/data/logs/daily-$(date +%F).log"
+          if [ -n "$ROUND" ]; then
+            # A round runs only between the two dates in the private settings, and
+            # not within two and a half hours of a round that finished cleanly.
+            today="${PRETEND:-$(date +%F)}"
+            start=$(sed -n 's/^rounds_start: *"\{0,1\}\([0-9-]*\).*/\1/p' private/config/posting.yaml)
+            until=$(sed -n 's/^rounds_until: *"\{0,1\}\([0-9-]*\).*/\1/p' private/config/posting.yaml)
+            last=$(sed -n 's/^round finished \([0-9T:-]*\)$/\1/p' "$log" 2> /dev/null | tail -1)
+            if [ -n "$FORCE" ]; then
+              :
+            elif [ -z "$start" ] || [[ "$today" < "$start" ]] || [[ "$today" > "${until:-$start}" ]]; then
+              echo "done=true" >> "$GITHUB_OUTPUT"
+              echo "rounds are not switched on for today; nothing to do"
+            elif [ -n "$last" ] && [ $(( $(date +%s) - $(date -d "$last" +%s) )) -lt 9000 ]; then
+              echo "done=true" >> "$GITHUB_OUTPUT"
+              echo "a round finished a short while ago; nothing to do"
+            fi
+          elif [ -z "$FORCE" ] && grep -qx "daily run finished" "$log" 2> /dev/null; then
             echo "done=true" >> "$GITHUB_OUTPUT"
             echo "today's run already finished; nothing to do"
           fi
@@ -136,6 +166,7 @@ jobs:
           CLIPS: ${{ inputs.clips }}
         run: |
           args=(--quiet)
+          [ -n "$ROUND" ] && args+=(--round)
           [ -n "$FORCE" ] && args+=(--force)
           [[ "$CLIPS" =~ ^[0-9]+$ ]] && args+=(--clips "$CLIPS")
           [ -n "$CLIP_DRY_RUN" ] && echo "trial: nothing will be sent to any platform"
@@ -152,7 +183,8 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then echo "nothing new to save"; exit 0; fi
-          git commit -q -m "Daily run $(date +%F)"
+          if [ -n "$ROUND" ]; then what="Round"; else what="Daily run"; fi
+          git commit -q -m "$what $(date +%F)"
           if [ "$STATE_BRANCH" = main ]; then
             # Keep anything the owner pushed while this run was going.
             git pull -q --rebase origin main
