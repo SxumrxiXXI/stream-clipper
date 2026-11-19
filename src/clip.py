@@ -263,35 +263,6 @@ def fetch_window(url: str, start: float, end: float) -> Path:
     return out
 
 
-def data_line(moment: dict, seed: int = 0) -> str:
-    """One sentence about how the moment was received, from the scanner's own
-    numbers: true by construction, and something the footage does not show.
-    The strongest fact available is used, in one of a few wordings so that
-    clips do not all wear the same sentence. "" when nothing is worth saying."""
-    people, ratio = int(moment.get("chatters") or 0), round(float(moment.get("chat_ratio") or 0))
-    views = int(moment.get("viewer_clip_views") or 0)
-    hours = int(float(moment.get("stream_seconds") or 0) // 3600)
-    if moment.get("stream_peak") and hours >= 2:
-        say = [f"Chat's biggest reaction in {hours} hours of stream",
-               f"No moment in {hours} hours of stream got chat going more",
-               f"{hours} hours of stream, and chat reacted most to this"]
-    elif views >= 500:
-        say = [f"Viewers' own Twitch clips of this: {views:,} views",
-               f"Twitch viewers clipped this themselves: {views:,} views so far",
-               f"{views:,} views on viewers' own Twitch clips of this"]
-    elif ratio >= 5 and people >= 40:
-        say = [f"Chat was {ratio} times busier than usual here",
-               f"Chat ran at {ratio}x its usual pace for this",
-               f"{ratio}x the usual chat: {people} people reacted"]
-    elif people >= 60:
-        say = [f"{people} people in chat reacted to this",
-               f"{people} different chatters reacted to this one",
-               f"Chat's reaction: {people} people typing"]
-    else:
-        return ""
-    return say[seed % len(say)]
-
-
 def word_times(job_id: str) -> list[tuple[float, str]]:
     """(time, word) for every word OpenShorts transcribed, in window seconds."""
     out = []
@@ -359,8 +330,9 @@ def context_lines(verdict: dict, parts: list[list[float]], job_id: str, moment: 
     2. a second, separate model call finds it plainly about the clip's event,
        understandable alone and, for the opening line, not a spoiler, and picks
        it as the one worth printing. It is free to pick none.
-    If no words from after the clip qualify, the line after the payoff is one of
-    the scanner's own facts about how the moment was received.
+    If no words qualify there is no line: the scanner's own numbers (how busy
+    chat was, viewers' clip views) are never printed on a clip. Yousef, 19 Nov
+    2026: the audience does not need to know them.
     """
     import judge
     script = labelled_transcript(job_id, parts)
@@ -419,12 +391,7 @@ def context_lines(verdict: dict, parts: list[list[float]], job_id: str, moment: 
         q = " ".join(said)
         return f'{FRAMES[role][seed % len(FRAMES[role])]} "{q[:1].upper() + q[1:]}"'
 
-    before, after = line("before"), line("after")
-    if not after:
-        after = data_line(moment or {}, seed)
-        if after:
-            log(f"       after  from our own numbers                 \"{after}\"")
-    return before, after
+    return line("before"), line("after")
 
 
 def judge_moment(window: Path, moment: dict, args) -> dict | None:
