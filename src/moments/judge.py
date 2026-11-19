@@ -47,6 +47,7 @@ class Verdict(BaseModel):
     chat_was_prompted: bool     # chat is typing because it was asked to (vote, answer, mini-game, giveaway)
     needs_earlier_context: bool
     watching_a_video: bool      # the stream is showing someone else's video or clip, and that is the moment
+    sexual_content: bool        # nudity, a strip club, a lap dance, a sex scene: in a game as much as in real life
     reaction_in_clip: bool      # the streamer, casters or crowd audibly or visibly react
     has_clear_moment: bool
     start: str                  # "MM:SS" in the video; the model is steadier with clock times
@@ -82,7 +83,7 @@ Live chat during this stretch, as "MM:SS message":
 
 Watch and listen to the whole video, then decide.
 
-0. Four yes/no facts. Answer these before anything else, literally:
+0. Yes/no facts. Answer these before anything else, literally:
    - event_happened: does one discrete event occur in the video: a play, a kill, a fail, a joke
      that lands, an accident, an outburst, a surprise? A person simply talking, explaining,
      reading chat or asking a question is NOT an event.
@@ -94,6 +95,11 @@ Watch and listen to the whole video, then decide.
    - watching_a_video: is the thing being reacted to a video, clip or post by someone else
      that the streamer is playing in a browser or player (a reaction to other people's
      content)? Gameplay, the streamer's own camera and a tournament broadcast are not this.
+   - sexual_content: is there nudity or sexual content on screen at ANY point of this video:
+     a strip club, strippers, a lap dance, a sex scene, sexual acts, exposed breasts,
+     buttocks or genitals, a sexualised close-up of a body? It counts the same in a video
+     game as in real life: the platforms remove it whatever the game's age rating. Game
+     violence, swearing and ordinary clothed characters are not this.
    - reaction_in_clip: can you hear or see the streamer, casters or a crowd react?
 
 1. has_clear_moment: true only if ONE specific thing happens that chat is reacting to and that
@@ -263,6 +269,10 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
     v["game_label_ok"] = bool(v.get("game_label_ok", True))
     # The yes/no facts gate the clip; the scores only rank what passes.
     reasons = []
+    if v.get("sexual_content"):
+        # The first GTA VI rehearsal on launch day picked a strip-club scene with
+        # a nude dancer. One such post can cost a new account everything.
+        reasons.append("nudity or sexual content on screen")
     if v.get("watching_a_video"):
         # A clip of someone watching a clip is other people's footage twice over,
         # and mostly shows a browser window.
