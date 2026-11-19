@@ -342,6 +342,11 @@ def scan(a) -> None:
     for m in found:
         if not eligible(m):
             continue
+        # What viewers called their own clips of the moment is a cheap first
+        # filter for adult and gambling material, before the judge is asked.
+        named = " ".join(str(c[1]) for c in m.get("clips") or []).lower()
+        if any(w in named for w in rules["skip_title_words"]):
+            continue
         if any(src == m["vod_url"] and overlap(m["start"], m["end"], s0 - 30, s1 + 30) for src, s0, s1 in done):
             continue
         if not m["permission"].strip():
