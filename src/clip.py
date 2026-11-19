@@ -450,6 +450,141 @@ def ass_time(t: float) -> str:
     return f"{int(t // 3600)}:{int(t % 3600 // 60):02d}:{t % 60:05.2f}"
 
 
+def landscape(camp: dict) -> bool:
+    """The layout the owner asked for on 2026-11-19: the whole landscape picture
+    across the middle of the 9:16 frame, over a blurred, zoomed copy of itself,
+    with everything we print in the blurred bands above and below it."""
+    return str((camp.get("render") or {}).get("fill", "")).lower() == "landscape_blur"
+
+
+def caption_chunks(job_id: str, parts: list[list[float]], max_chars: int,
+                   max_seconds: float = 1.4) -> list[tuple[float, float, str]]:
+    """The words spoken inside the clip as (start, end, text) in clip seconds,
+    two or three words at a time."""
+    words = []
+    for seg in transcript_of(job_id):
+        for w in seg.get("words") or []:
+            try:
+                t0, t1, text = float(w["start"]), float(w["end"]), str(w.get("word") or "").strip()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if text and any(a - 0.05 <= (t0 + t1) / 2 <= b + 0.05 for a, b in parts):
+                words.append((clip_time(t0, parts), clip_time(t1, parts), text))
+    chunks, cur = [], []
+    for w in words:
+        if cur and (len(" ".join(x[2] for x in cur + [w])) > max_chars
+                    or w[1] - cur[0][0] > max_seconds or w[0] - cur[-1][1] > 0.7):
+            chunks.append(cur)
+            cur = []
+        cur.append(w)
+    if cur:
+        chunks.append(cur)
+    out = []
+    for n, c in enumerate(chunks):
+        start, end = c[0][0], c[-1][1] + 0.3
+        if n + 1 < len(chunks):
+            end = min(end, chunks[n + 1][0][0])
+        out.append((start, max(end, start + 0.25), " ".join(x[2] for x in c)))
+    return out
+
+
+def draw_text(job_id: str, video_url: str, *, parts: list[list[float]], aspect: float, camp: dict,
+              hook: str = "", before: str = "", after: str = "", payoff: float = 0.0) -> str:
+    """Burn everything we print onto a clip in the landscape layout, in one pass,
+    and return the new video URL.
+
+    The picture is a band across the middle. Captions sit directly under it and
+    grow downwards; the hook and the context lines sit directly above it and
+    grow upwards. Nothing covers the gameplay, and nothing is low enough to end
+    up under the platforms' own buttons and caption text (roughly the bottom
+    quarter of the screen).
+    """
+    name = urllib.parse.unquote(video_url.rsplit("/", 1)[-1])
+    src = OPENSHORTS_DIR / "output" / job_id / name
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                            "stream=width,height", "-of", "csv=p=0", str(src)], capture_output=True, text=True)
+    try:
+        w, h = (int(x) for x in probe.stdout.strip().split(",")[:2])
+    except ValueError:
+        w, h = 1080, 1920
+    r = camp["render"]
+    picture = min(h, int(round(w / max(aspect, 0.1))))
+    top = (h - picture) // 2
+    bottom = top + picture
+    gap, side = round(h * 0.016), round(w * 0.06)
+    cap_size, line_size = round(h * 0.068), round(h * 0.051)
+    outline = max(5, round(h * 0.0045))
+    total = sum(b - a for a, b in parts)
+
+    def esc(text: str) -> str:
+        return text.replace("\\", "").replace("{", "(").replace("}", ")").replace("\n", " ").strip()
+
+    def style(label: str, size: int, colour: str, align: int, margin_v: int) -> str:
+        return (f"Style: {label},Anton,{size},{colour},{colour},&H00000000,&H96000000,0,0,0,0,100,100,0,0,1,"
+                f"{outline},0,{align},{side},{side},{margin_v},1")
+
+    events = []
+    caps = r["captions"]
+    for a, b, text in caption_chunks(job_id, parts, int(caps.get("max_chars", 16))):
+        text = text.upper() if caps.get("uppercase", True) else text
+        events.append(f"Dialogue: 1,{ass_time(a)},{ass_time(min(b, total))},Cap,,0,0,0,,{esc(text)}")
+    if not events:
+        log("no speech in this cut: keeping the clip without captions")
+    payoff = min(max(payoff + 0.3, 2.5), max(2.5, total - 2.5))
+    if hook and (r.get("hook") or {}).get("enabled", True):
+        seconds = float((r.get("hook") or {}).get("duration_seconds", 2))
+        events.append(f"Dialogue: 0,{ass_time(0)},{ass_time(seconds)},Line,,0,0,0,,{{\\fad(0,150)}}{esc(hook)}")
+    if before:
+        events.append(f"Dialogue: 0,{ass_time(0)},{ass_time(payoff)},Line,,0,0,0,,{{\\fad(120,120)}}{esc(before)}")
+    if after:
+        late = max(payoff, total - 7.0)        # it is about what came after: the clip's last seconds
+        events.append(f"Dialogue: 0,{ass_time(late)},{ass_time(total + 5)},After,,0,0,0,,{{\\fad(150,0)}}{esc(after)}")
+    if not events:
+        return video_url
+    ass = "\n".join([
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {w}", f"PlayResY: {h}", "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+        "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, "
+        "MarginR, MarginV, Encoding",
+        style("Cap", cap_size, "&H00FFFFFF", 8, bottom + gap // 2),         # top edge just under the picture
+        style("Line", line_size, "&H00FFFFFF", 2, h - top + gap),           # bottom edge just above it
+        style("After", line_size, "&H0000E6FF", 2, h - top + gap),          # yellow (BGR)
+        "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        *events, ""])
+    sub = OPENSHORTS_DIR / "uploads" / f"txt_{job_id}.ass"
+    sub.parent.mkdir(exist_ok=True)
+    sub.write_text(ass)
+    out_name = "text_" + name
+    cmd = ["docker", "compose", "exec", "-T", "backend", "ffmpeg", "-v", "error", "-y",
+           "-i", f"/app/output/{job_id}/{name}",
+           "-vf", f"ass=/app/uploads/{sub.name}:fontsdir=/app/fonts",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "copy",
+           "-movflags", "+faststart", f"/app/output/{job_id}/{out_name}"]
+    res = subprocess.run(cmd, cwd=OPENSHORTS_DIR, env=docker_env(), capture_output=True, text=True)
+    sub.unlink(missing_ok=True)
+    if res.returncode != 0:
+        die(f"could not draw the text on the clip: {res.stderr.strip()[-300:]}")
+    return f"/videos/{job_id}/{urllib.parse.quote(out_name)}"
+
+
+def reframe(job_id: str, index: int, parts: list[list[float]], key: str, wide: bool) -> tuple[str, list[list[float]]]:
+    """Cut clip `index` to `parts` (window seconds) and, for the landscape layout,
+    have OpenShorts show the whole frame over a blurred copy of itself. Returns
+    the new video URL and the pieces as OpenShorts snapped them to word edges."""
+    body = {"job_id": job_id, "clip_index": index, "snap_to_words": True, "reapply_captions": False,
+            "segments": [{"start": a, "end": b} for a, b in parts]}
+    if wide:
+        body["framing"] = "full"
+    res = api_json("POST", "/api/clip/rerender", body, key) or {}
+    snapped = ((res.get("recipe") or {}).get("segments")) or res.get("segments") or []
+    try:
+        snapped = [[float(x["start"]), float(x["end"])] for x in snapped]
+    except (KeyError, TypeError, ValueError):
+        snapped = []
+    return res.get("new_video_url") or res.get("video_url") or "", snapped or parts
+
+
 def add_context(job_id: str, video_url: str, before: str, after: str, payoff: float, total: float) -> str:
     """Burn the page's own context onto a finished clip and return the new video URL.
 
@@ -746,6 +881,17 @@ def main() -> None:
              f"Template: {camp['name']}\n"]
     handle = camp["post"]["handle"]
 
+    wide = landscape(camp)
+    framed: dict[int, str] = {}        # clip index -> the re-rendered video, before any text
+    aspect = 16 / 9
+    if wide:
+        shape = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                "stream=width,height", "-of", "csv=p=0", str(window or source)],
+                               capture_output=True, text=True).stdout.strip().split(",")
+        try:
+            aspect = int(shape[0]) / int(shape[1])
+        except (ValueError, IndexError, ZeroDivisionError):
+            pass
     if verdict:
         # One clip, cut exactly where the judge put the moment, with the judge's text.
         clips = clips[:1]
@@ -781,16 +927,17 @@ def main() -> None:
             # posted as it is. A clip made on 17 Nov had "retarded" burned into it
             # twice and was withdrawn hours before it went out.
             turn_down("a slur is spoken in this cut", "a slur is spoken in the cut")
-        if abs(float(c0.get("start", 0)) - verdict["start"]) > 1 or abs(float(c0.get("end", 0)) - verdict["end"]) > 1:
-            log(f"re-cutting to the judged moment: {verdict['start']:.1f}-{verdict['end']:.1f} s of the window")
+        if wide or abs(float(c0.get("start", 0)) - verdict["start"]) > 1 or abs(float(c0.get("end", 0)) - verdict["end"]) > 1:
+            log(f"re-cutting to the judged moment: {verdict['start']:.1f}-{verdict['end']:.1f} s of the window"
+                + (", whole picture over a blurred copy" if wide else ""))
             if len(parts) > 1:
                 log(f"the reaction comes after a silence: keeping {parts[0][0]:.1f}-{parts[0][1]:.1f} s "
                     f"and {parts[1][0]:.1f}-{parts[1][1]:.1f} s")
             elif parts[0][1] > tail + 0.2:
                 log(f"letting the sentence finish: the cut now ends at {parts[0][1]:.1f} s")
-            api_json("POST", "/api/clip/rerender", {
-                "job_id": job_id, "clip_index": 0, "snap_to_words": True, "reapply_captions": False,
-                "segments": [{"start": a, "end": b} for a, b in parts]}, key)
+            framed[0], snapped = reframe(job_id, 0, parts, key, wide)
+            if wide:
+                parts = snapped                # captions are timed against the cut as it really is
             verdict["end"] = verdict["start"] + sum(b - a for a, b in parts)   # so the length is right
         c0.update({"start": verdict["start"], "end": verdict["end"], "viral_hook_text": verdict["hook"],
                    "video_description_for_tiktok": verdict["caption"],
@@ -821,7 +968,18 @@ def main() -> None:
         if solo:
             progress.report("Making clips", i + 1, len(clips) + 1, f"captions on clip {i + 1} of {len(clips)}",
                             started_at=started)
-        if fmt != "classic":
+        if wide:
+            # Everything is drawn by us, in one pass, around the picture.
+            mine = parts if verdict else [[float(c.get("start", 0)), float(c.get("end", 0))]]
+            if i not in framed:
+                framed[i], mine = reframe(job_id, i, mine, key, True)
+            video_url = draw_text(
+                job_id, framed[i] or c.get("video_url", ""), parts=mine, aspect=aspect, camp=camp,
+                hook="" if fmt == "context" else hook, before=ctx_before, after=ctx_after,
+                payoff=clip_time(verdict["payoff_at"], mine) if verdict else 0.0)
+            if fmt != "classic":
+                log(f"       before: {ctx_before or '(the hook)'}  |  after: {ctx_after or '-'}")
+        elif fmt != "classic":
             video_url = burn(job_id, i, "" if fmt == "context" else hook, camp, key)
             total = sum(b - a for a, b in parts)
             video_url = add_context(job_id, video_url, ctx_before, ctx_after,
