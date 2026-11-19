@@ -32,10 +32,22 @@ TRACKER = ROOT / "tracker.csv"
 
 
 # --------------------------------------------------------------------------- #
+def live_on(cfg: dict, day: dt.date) -> bool:
+    """Is live posting (src/live.py) switched on for this date?"""
+    start, until = str(cfg.get("live_start") or ""), str(cfg.get("live_until") or "")
+    return bool(cfg.get("live")) and (not start or start <= day.isoformat()) and (not until or day.isoformat() <= until)
+
+
 def config() -> dict:
     cfg = yaml.safe_load((ROOT / "config" / "posting.yaml").read_text())
     if os.environ.get("CLIP_DRY_RUN"):       # a trial: nothing is sent, whatever the file says
         cfg["auto_post"] = False
+    # While live posting covers the coming night, the daily run fills only the
+    # slots outside it (`live_day_slots`), and makes that many clips.
+    tomorrow = dt.datetime.now(ZoneInfo(cfg["timezone"])).date() + dt.timedelta(days=1)
+    if cfg.get("live_day_slots") and live_on(cfg, tomorrow):
+        cfg["slots"] = [str(x) for x in cfg["live_day_slots"]]
+        cfg["clips_per_day"] = len(cfg["slots"])
     return cfg
 
 
@@ -56,7 +68,13 @@ def add(item: dict) -> None:
     items = load()
     if any(i["video"] == item["video"] for i in items):
         return
-    item = {"id": f"c{len(items) + 1:04d}", "status": "ready", "scheduled_for": None,
+    # The live watcher numbers its clips apart (v0001 ...): it runs beside the daily
+    # run, and two runs counting the same list would hand out the same number.
+    prefix = "v" if os.environ.get("CLIP_LIVE") else "c"
+    taken = [int(i["id"][1:]) for i in items if str(i.get("id", ""))[:1] == prefix and str(i["id"])[1:].isdigit()]
+    number = max(taken, default=0) + 1 if prefix == "v" else max(len(items), max(taken, default=0)) + 1
+    item = {"id": f"{prefix}{number:04d}", "status": "ready", "scheduled_for": None,
+            **({"live": True} if prefix == "v" else {}),
             "request_id": None, "views": {}, "created": dt.datetime.now().isoformat(timespec="seconds"),
             **item}
     items.append(item)
@@ -125,8 +143,10 @@ def plan_fresh(cfg: dict, items: list[dict], now: dt.datetime) -> tuple[list[dic
         day += dt.timedelta(days=1)
     keep_days = float(cfg.get("reserve_days", 3))
 
-    fresh = by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"]])
-    reserve = [i for i in items if i["status"] == "scheduled" and i.get("scheduled_for")
+    # The night's live clips have their own times (post_live); they are never
+    # planned, moved or withdrawn here.
+    fresh = by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"] and not i.get("live")])
+    reserve = [i for i in items if i["status"] == "scheduled" and i.get("scheduled_for") and not i.get("live")
                and dt.datetime.fromisoformat(i["scheduled_for"]) > soon]
     reserve.sort(key=lambda i: ((i.get("judge") or {}).get("overall", 0), float(i.get("score") or 0)), reverse=True)
 
@@ -172,7 +192,8 @@ def plan_round(cfg: dict, items: list[dict], now: dt.datetime) -> list[dict]:
         slots += [w for w in (dt.datetime.combine(day, t, tz) for t in times) if w >= soon]
         day += dt.timedelta(days=1)
     placed = []
-    for item in by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"]]):
+    for item in by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"]
+                             and not i.get("live")]):
         item["scheduled_for"] = slots.pop(0).isoformat()
         dress(item, items)
         placed.append(item)
@@ -466,6 +487,63 @@ def post_now(cfg: dict, items: list[dict], ids: list[str]) -> None:
         save(items)
 
 
+def live_room(cfg: dict, items: list[dict], when: dt.datetime) -> tuple[bool, str]:
+    """May a live clip be placed at `when`? -> (yes or no, why not).
+
+    Not if another clip already holds that time (within 20 minutes of it), and
+    not beyond `live_max_per_day` live clips on that calendar day."""
+    tz = ZoneInfo(cfg["timezone"])
+    placed = [(dt.datetime.fromisoformat(i["scheduled_for"]).astimezone(tz), i) for i in items
+              if i["status"] in ("ready", "scheduled", "posted") and i.get("scheduled_for")]
+    for t, i in placed:
+        if abs((t - when).total_seconds()) < 20 * 60:
+            return False, f"{i['id']} is already placed at {t:%H:%M}"
+    day = [1 for t, i in placed if i.get("live") and t.date() == when.astimezone(tz).date()]
+    most = int(cfg.get("live_max_per_day", 8))
+    if len(day) >= most:
+        return False, f"{len(day)} live clips are placed on that day already (the limit is {most})"
+    return True, ""
+
+
+def post_live(cfg: dict, items: list[dict], really: bool, when: dt.datetime | None = None) -> int:
+    """Hand the live run's new clip to Upload-Post for `when` (the top of the
+    hour), or publish it at once if that time is less than three minutes away or
+    already past. Nothing else in the queue is touched. Returns how many clips
+    were placed (or would have been, in a trial)."""
+    tz = ZoneInfo(cfg["timezone"])
+    new = [i for i in items if i.get("live") and i["status"] == "ready" and not i["scheduled_for"]]
+    sent = 0
+    for i in new:
+        now = dt.datetime.now(tz)
+        at = when if when and when - now >= dt.timedelta(minutes=3) else None
+        ok, why = live_room(cfg, items, when or now)
+        if not ok:
+            i["status"], i["note"] = "skipped", f"made live but not posted: {why}"
+            print(f"NOT POSTED  {i['id']}  ({why})")
+            save(items)
+            continue
+        dress(i, items)
+        if not really:
+            print(f"would post {'at ' + format(at, '%H:%M') if at else 'now'}  {i['id']}  {i.get('streamer', '')}"
+                  f"  -> {', '.join(cfg['platforms'])}")
+            i["status"], i["note"] = "skipped", "trial: would have been posted live"
+            save(items)
+            sent += 1
+            continue
+        if at:
+            i["scheduled_for"] = at.isoformat()
+            for x in items:                    # send only this clip
+                x["_held"] = x is not i
+            send(cfg, items, really=True)
+            for x in items:
+                x.pop("_held", None)
+        else:
+            post_now(cfg, items, [i["id"]])
+        sent += 1 if i["status"] == "scheduled" else 0
+        save(items)
+    return sent
+
+
 def resend(cfg: dict, items: list[dict], ids: list[str]) -> None:
     """Withdraw scheduled clips and schedule them again at the same slot, with the
     platforms and text the config gives today (used after adding a platform)."""
@@ -742,6 +820,7 @@ def main() -> None:
     k.add_argument("ids", nargs="+")
     k = sub.add_parser("skip")
     k.add_argument("id")
+    sub.add_parser("live", help="publish the live run's new clip now")
     sub.add_parser("check", help="confirm that every post whose slot has passed went out")
     sub.add_parser("stats")
     sub.add_parser("report")
@@ -783,6 +862,8 @@ def main() -> None:
         post_now(cfg, items, a.ids)
     elif a.cmd == "resend":
         resend(cfg, items, a.ids)
+    elif a.cmd == "live":
+        post_live(cfg, items, really=bool(cfg.get("auto_post")))
     elif a.cmd == "skip":
         hit = [i for i in items if i["id"] == a.id]
         if not hit:

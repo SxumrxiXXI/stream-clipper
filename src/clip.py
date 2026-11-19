@@ -174,6 +174,62 @@ def submit(source: str, is_file: bool, camp: dict, n_clips: int, key: str,
     return resp["job_id"]
 
 
+def fetch_segments(url: str, start: float, end: float, out: Path) -> bool:
+    """Download [start, end] of a Twitch recording by fetching only the segments
+    that hold it, also while the stream is still live. False if the recording is
+    not laid out the simple way (then the caller falls back to yt-dlp)."""
+    if "twitch.tv/videos/" not in url:
+        return False
+    got = subprocess.run(["yt-dlp", "--no-warnings", "-q", "-g", "-f", "best[height<=1080]/best", url],
+                         capture_output=True, text=True, timeout=90)
+    lines = got.stdout.strip().splitlines()
+    if got.returncode != 0 or not lines or ".m3u8" not in lines[0]:
+        return False
+    playlist = lines[0]
+
+    def get(u: str, tries: int = 3) -> bytes:
+        for n in range(tries):
+            try:
+                with urllib.request.urlopen(u, timeout=30) as r:
+                    return r.read()
+            except Exception:
+                if n == tries - 1:
+                    raise
+                time.sleep(2)
+        return b""
+
+    t, dur, init, want, inits = 0.0, 0.0, None, [], set()
+    for line in get(playlist).decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-MAP:"):
+            m = re.search(r'URI="([^"]+)"', line)
+            init = m.group(1) if m else None
+        elif line.startswith("#EXTINF:"):
+            dur = float(line[8:].split(",")[0])
+        elif line and not line.startswith("#"):
+            if t + dur > start - 2 and t < end + 2:
+                want.append((t, line))
+                inits.add(init)
+            t += dur
+    if not want or len(inits) != 1 or t < end - 1:
+        return False                    # nothing there yet, the stretch is past the end, or the layout changes midway
+    raw = out.with_suffix(".part.ts" if init is None else ".part.mp4")
+    with open(raw, "wb") as f:
+        if init:
+            f.write(get(urllib.parse.urljoin(playlist, init)))
+        for _, name in want:
+            f.write(get(urllib.parse.urljoin(playlist, name)))
+    try:
+        # Cut exactly and re-encode, as --force-keyframes-at-cuts did.
+        done = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{max(0.0, start - want[0][0]):.3f}",
+                               "-i", str(raw), "-t", f"{end - start:.3f}", "-c:v", "libx264", "-preset", "veryfast",
+                               "-crf", "18", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(out)],
+                              capture_output=True, text=True, timeout=300)
+    finally:
+        raw.unlink(missing_ok=True)
+    return done.returncode == 0 and out.exists() and out.stat().st_size > 100_000
+
+
 def fetch_window(url: str, start: float, end: float) -> Path:
     """Download only [start, end] of a VOD (OpenShorts would fetch all of it)."""
     WINDOWS = ROOT / "data" / "windows"
@@ -182,6 +238,15 @@ def fetch_window(url: str, start: float, end: float) -> Path:
     out = WINDOWS / f"{stem}_{int(start)}-{int(end)}.mp4"
     if out.exists() and out.stat().st_size > 100_000:
         return out
+    # First the quick way: only the few segments that hold the stretch. (yt-dlp's
+    # own section download reads a recording that is still growing from its very
+    # start: seven hours into a live stream it stalled five times out of six.)
+    try:
+        if fetch_segments(url, start, end, out):
+            return out
+    except Exception as e:
+        log(f"       quick download did not work ({type(e).__name__}: {str(e)[:120]}); trying the slow way")
+    out.unlink(missing_ok=True)
     cmd = ["yt-dlp", "--no-warnings", "-q", "--socket-timeout", "30", "--retries", "3",
            "--download-sections", f"*{int(start)}-{int(end)}",
            "--force-keyframes-at-cuts", "-f", "best[height<=1080]/best", "--merge-output-format", "mp4",
@@ -394,6 +459,7 @@ def judge_moment(window: Path, moment: dict, args) -> dict | None:
         f.write(json.dumps({
             "at": dt.datetime.now().isoformat(timespec="seconds"), "source": args.source,
             "streamer": args.streamer, "start": args.start, "end": args.end, "keep": v["keep"],
+            **({"live": True} if os.environ.get("CLIP_LIVE") else {}),      # asked by the live watcher
             # Rejections are remembered so the same moment is not judged again tomorrow.
             **{k: v[k] for k in ("overall", "standalone", "opening", "payoff", "rank", "moment_type",
                                  "what_happens", "rejected_because", "problems", "hook", "cost_usd")},
@@ -401,7 +467,9 @@ def judge_moment(window: Path, moment: dict, args) -> dict | None:
     return v
 
 
-def wait(job_id: str) -> dict:
+def wait(job_id: str, fatal: bool = True) -> dict | None:
+    """The finished job's result. A failed job ends the program, unless `fatal`
+    is off: then None comes back and the caller may try again."""
     seen = 0
     while True:
         st = api_json("GET", f"/api/status/{job_id}")
@@ -415,6 +483,8 @@ def wait(job_id: str) -> dict:
         if st.get("status") == "completed":
             return st.get("result") or {}
         if st.get("status") in ("failed", "error", "cancelled"):
+            if not fatal:
+                return None
             die(f"OpenShorts job {st.get('status')}. Last log lines are above.")
         time.sleep(8)
 
@@ -865,11 +935,20 @@ def main() -> None:
                 moment["window"] = str(window)      # scan.py compares the kept candidates' footage
                 Path(args.moment).write_text(json.dumps(moment, ensure_ascii=False))
                 sys.exit(0)                 # the window stays on disk for the clip itself
-        job_id = submit(str(window), True, camp, n, key)
+        again = lambda: submit(str(window), True, camp, n, key)       # noqa: E731
     else:
-        job_id = submit(source, is_file, camp, n, key, args.start, args.end)
+        again = lambda: submit(source, is_file, camp, n, key, args.start, args.end)   # noqa: E731
+    job_id = again()
     log(f"job {job_id}")
-    result = wait(job_id)
+    # OpenShorts asks the AI service itself, and that call fails now and then
+    # ("high demand"). One more try a little later usually goes through.
+    result = wait(job_id, fatal=False)
+    if result is None:
+        log("the job failed; trying it once more in 45 s")
+        time.sleep(45)
+        job_id = again()
+        log(f"job {job_id}")
+        result = wait(job_id)
     clips = result.get("clips") or []
     if not clips:
         die("OpenShorts returned no clips for this source")

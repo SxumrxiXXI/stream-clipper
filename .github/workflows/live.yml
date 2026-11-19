@@ -79,46 +79,35 @@ jobs:
       - name: Anything to do?
         id: guard
         run: |
-          # Is there a posting time whose work starts within the next 75 minutes?
-          # (The same rule as `live.py --should-run`, without installing anything.)
-          if [ -n "$FORCE" ]; then echo "a trial, started by hand"; exit 0; fi
-          python3 - << 'PY' >> "$GITHUB_OUTPUT"
-          import datetime as dt, re
-          text = open("private/config/posting.yaml").read()
-          def one(key, default=""):
-              m = re.search(rf'^{key}:\s*"?([^"#\n]*)"?', text, re.M)
-              return m.group(1).strip() if m else default
-          line = re.search(r"^live_hours:(.*)$", text, re.M)
-          hours = re.findall(r"\d\d:\d\d", line.group(1).split("#")[0]) if line else []
-          lead = float(one("live_lead_minutes", "25") or 25)
-          now = dt.datetime.now()                    # TZ is set to the settings' zone
-          soon = False
-          for day in (now.date(), now.date() + dt.timedelta(days=1)):
-              d = day.isoformat()
-              if one("live") != "true" or (one("live_start") and d < one("live_start")) or (one("live_until") and d > one("live_until")):
-                  continue
-              for h in hours:
-                  when = dt.datetime.combine(day, dt.time.fromisoformat(h))
-                  if when - now > dt.timedelta(minutes=8) and when - dt.timedelta(minutes=lead) - now <= dt.timedelta(minutes=75):
-                      soon = True
-          print("done=false" if soon else "done=true")
-          PY
-          grep -q "done=true" "$GITHUB_OUTPUT" && echo "no posting time coming up; nothing to do" || echo "there is a posting time coming up"
+          # work: a posting time is coming up. idle: live posting is on but the next
+          # posting time is hours away, so only wait and start the next run. none:
+          # switched off. (deploy/live_guard.py explains why idle runs exist.)
+          if [ -n "$FORCE" ]; then echo "mode=work" >> "$GITHUB_OUTPUT"; echo "a trial, started by hand"; exit 0; fi
+          python3 deploy/live_guard.py | tee -a "$GITHUB_OUTPUT"
+
+      - name: Wait for the night
+        if: steps.guard.outputs.mode == 'idle'
+        env:
+          SECONDS_TO_WAIT: ${{ steps.guard.outputs.seconds }}
+        run: |
+          [[ "$SECONDS_TO_WAIT" =~ ^[0-9]+$ ]] || SECONDS_TO_WAIT=60
+          echo "waiting $((SECONDS_TO_WAIT / 60)) minutes; nothing is set up or posted by this run"
+          sleep "$SECONDS_TO_WAIT"
 
       - name: Link them into place
-        if: steps.guard.outputs.done != 'true'
+        if: steps.guard.outputs.mode == 'work'
         run: |
           ln -s private/config config
           ln -s private/data data
           mkdir -p data/logs
 
       - uses: actions/setup-python@v5
-        if: steps.guard.outputs.done != 'true'
+        if: steps.guard.outputs.mode == 'work'
         with:
           python-version: "3.11"
 
       - name: Tools
-        if: steps.guard.outputs.done != 'true'
+        if: steps.guard.outputs.mode == 'work'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg unzip > /dev/null
           pip install -q -r requirements.txt yt-dlp
@@ -128,7 +117,7 @@ jobs:
           unzip -q -o /tmp/tdl.zip TwitchDownloaderCLI -d tools && chmod +x tools/TwitchDownloaderCLI
 
       - name: OpenShorts
-        if: steps.guard.outputs.done != 'true'
+        if: steps.guard.outputs.mode == 'work'
         run: |
           git clone -q https://github.com/mutonby/openshorts.git vendor/openshorts
           git -C vendor/openshorts checkout -q "$OPENSHORTS_COMMIT"
@@ -139,7 +128,7 @@ jobs:
           docker compose up -d --no-build backend
 
       - name: Keys
-        if: steps.guard.outputs.done != 'true'
+        if: steps.guard.outputs.mode == 'work'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           UPLOAD_POST_API_KEY: ${{ secrets.UPLOAD_POST_API_KEY }}
@@ -152,7 +141,7 @@ jobs:
           test -n "$GEMINI_API_KEY" || { echo "the keys are not set in this repository's secrets"; exit 1; }
 
       - name: Live posting
-        if: steps.guard.outputs.done != 'true'
+        if: steps.guard.outputs.mode == 'work'
         env:
           HOURS: ${{ inputs.hours || '5' }}
         run: |
@@ -167,20 +156,22 @@ jobs:
           python src/live.py "${args[@]}"
 
       - name: Save the records
-        if: always() && steps.guard.outputs.done != 'true'
+        if: always() && steps.guard.outputs.mode == 'work'
         run: bash deploy/save_state.sh "Live posting $(date '+%F %H:%M')"
 
-      # The next run, if the settings still want one. Read after saving, so a
+      # The next run, if the settings still want one. They are read afresh, so a
       # switch-off the owner pushed while this run was going is seen.
       - name: Start the next run
-        if: success() && steps.guard.outputs.done != 'true' && (github.event_name == 'schedule' || (inputs.chain && !inputs.dry_run))
+        if: success() && steps.guard.outputs.mode != 'none' && (github.event_name == 'schedule' || (inputs.chain && !inputs.dry_run))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if python src/live.py --should-run > /dev/null; then
+          git -C private pull -q --rebase origin main 2> /dev/null || true
+          mode=$(python3 deploy/live_guard.py | sed -n 's/^mode=//p')
+          if [ "$mode" = work ] || [ "$mode" = idle ]; then
             gh workflow run live.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
               -f dry_run=false -f chain=true -f hours=5 -f state_branch=main
             echo "the next run was started"
           else
-            echo "no posting time coming up (or switched off); not starting another run"
+            echo "switched off, or the last live day is over; not starting another run"
           fi

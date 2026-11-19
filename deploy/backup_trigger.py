@@ -10,11 +10,13 @@ It starts
   is under way,
 - a round (the short run between daily runs), on the days the settings switch
   rounds on, if its time passed 5 to 60 minutes ago and GitHub has not started
-  one since, and
+  one since,
+- live posting, through the night hours the settings list, if no run of it
+  is going (each run starts the next; this only mends a broken chain), and
 - the post check, if a clip's slot passed more than ten minutes ago, nothing
   has confirmed it yet, and no check has started in the last 40 minutes.
 
-Both workflows protect themselves against a second start, so pressing twice
+The workflows protect themselves against a second start, so pressing twice
 is harmless. Needs the GitHub CLI (`gh`), signed in. `--dry-run` only prints.
 """
 from __future__ import annotations
@@ -116,6 +118,29 @@ def main() -> None:
                    "-f", "round=true", "-f", "dry_run=false", "-f", "force=false", "-f", "state_branch=main")
                 stamp.parent.mkdir(parents=True, exist_ok=True)
                 stamp.write_text("started")
+
+    # ---- live posting -------------------------------------------------------
+    # The same rule as the workflow's own guard: is there a live hour whose work
+    # starts within the next 75 minutes? Then a run should be going.
+    lead = dt.timedelta(minutes=float(cfg.get("live_lead_minutes", 25)))
+    soon = False
+    for day in (now.date(), now.date() + dt.timedelta(days=1)):
+        start, until = str(cfg.get("live_start") or ""), str(cfg.get("live_until") or "")
+        if not cfg.get("live") or (start and day.isoformat() < start) or (until and day.isoformat() > until):
+            continue
+        for text in cfg.get("live_hours") or []:
+            when = dt.datetime.combine(day, dt.time.fromisoformat(str(text)), tz)
+            soon = soon or (when - now > dt.timedelta(minutes=8) and when - lead - now <= dt.timedelta(minutes=75))
+    if soon:
+        watchers = [r for r in runs(public, "live.yml") if r.get("headBranch") == "main"]
+        going = any(r["status"] in ACTIVE for r in watchers)
+        just = any(dt.datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00")) > now - dt.timedelta(minutes=20)
+                   for r in watchers)
+        if not going and not just:
+            say("live posting is not running: starting it" + (" (dry run, not started)" if DRY else ""))
+            if not DRY:
+                gh("workflow", "run", "live.yml", "-R", public, "--ref", "main",
+                   "-f", "dry_run=false", "-f", "chain=true", "-f", "hours=5", "-f", "state_branch=main")
 
     # ---- the post check -----------------------------------------------------
     try:
