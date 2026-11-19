@@ -394,6 +394,7 @@ def judge_moment(window: Path, moment: dict, args) -> dict | None:
         f.write(json.dumps({
             "at": dt.datetime.now().isoformat(timespec="seconds"), "source": args.source,
             "streamer": args.streamer, "start": args.start, "end": args.end, "keep": v["keep"],
+            **({"live": True} if os.environ.get("CLIP_LIVE") else {}),      # asked by the live watcher
             # Rejections are remembered so the same moment is not judged again tomorrow.
             **{k: v[k] for k in ("overall", "standalone", "opening", "payoff", "rank", "moment_type",
                                  "what_happens", "rejected_because", "problems", "hook", "cost_usd")},

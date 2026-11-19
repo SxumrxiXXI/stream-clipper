@@ -199,22 +199,10 @@ jobs:
           STATE_BRANCH: ${{ inputs.state_branch || 'main' }}
           ROUND: ${{ steps.guard.outputs.round }}
         run: |
-          [[ "$STATE_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "bad branch name"; exit 1; }
-          cd private
-          git config user.name "stream-clipper daily run"
-          git config user.email "actions@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then echo "nothing new to save"; exit 0; fi
+          # Shared with the post check and the live watcher, which may be saving at
+          # the same moment: see deploy/save_state.sh.
           if [ -n "$ROUND" ]; then what="Round"; else what="Daily run"; fi
-          git commit -q -m "$what $(date +%F)"
-          if [ "$STATE_BRANCH" = main ]; then
-            # Keep anything the owner pushed while this run was going.
-            git pull -q --rebase origin main
-            git push -q origin HEAD:main 2> /dev/null
-          else
-            git push -q --force origin "HEAD:refs/heads/${STATE_BRANCH}" 2> /dev/null
-          fi
-          echo "records saved to the private repository (${STATE_BRANCH})"
+          STATE_AUTHOR="stream-clipper daily run" bash deploy/save_state.sh "$what $(date +%F)"
 
       # GitHub switches a schedule off after 60 days without activity in the
       # repository. Re-enabling it on every run keeps the daily run alive.

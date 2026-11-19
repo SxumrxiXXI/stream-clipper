@@ -1,0 +1,173 @@
+# The live watcher: for a few hours at a time, look at the featured game's live
+# streams every few minutes and post a strong moment while the stream is still
+# going (src/live.py). Each run starts the next one when it ends, for as long as
+# the private settings say `live: true` and today is inside live_start..live_until.
+#
+# To stop it: set `live: false` in the private settings (it stops within half an
+# hour and does not start again), or disable this workflow.
+#
+# Nothing about individual clips or streamers is printed here, because this log
+# is public: only how many streams were looked at and whether a clip went out.
+name: live
+
+on:
+  # A safety net only: if the chain of runs breaks, one of these picks it up.
+  # GitHub's timer is best-effort, and outside the dates in the settings a start
+  # ends in seconds. A start while a watcher is running waits for it to finish.
+  schedule:
+    - cron: "23 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Watch, judge and make clips but post nothing"
+        type: boolean
+        default: true
+      hours:
+        description: "How long this run watches (at most 5)"
+        default: "5"
+      chain:
+        description: "Start the next run when this one ends (real runs only)"
+        type: boolean
+        default: false
+      force:
+        description: "Watch even if the settings have it switched off (for trials)"
+        type: boolean
+        default: false
+      min_score:
+        description: "Trial only: a lower bar for a moment to reach the judge, to exercise every step"
+        default: ""
+      state_branch:
+        description: "Branch of the private repository to save the records to"
+        default: "main"
+
+permissions:
+  contents: read
+  actions: write        # to start the next run of this workflow
+
+# One watcher at a time. It does not share the daily run's group: it runs for
+# hours and must not hold the daily run or the post checks back. Records are
+# merged when saved (deploy/save_state.sh).
+concurrency:
+  group: live
+  cancel-in-progress: false
+
+env:
+  TZ: Africa/Cairo
+  OPENSHORTS_COMMIT: 8af4a48a2bdda96c9a02bb8df3f09d4e7ec99e0f
+  OPENSHORTS_SERVICES: backend
+  STATE_BRANCH: ${{ inputs.state_branch || 'main' }}
+  STATE_AUTHOR: stream-clipper live watcher
+  DRY: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '' }}
+  FORCE: ${{ inputs.force && '1' || '' }}
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Private settings and records
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}-private
+          ssh-key: ${{ secrets.STATE_DEPLOY_KEY }}
+          path: private
+
+      - name: Switched on?
+        id: guard
+        run: |
+          cfg=private/config/posting.yaml
+          today=$(date +%F)
+          on=$(sed -n 's/^live: *\([a-z]*\).*/\1/p' "$cfg")
+          start=$(sed -n 's/^live_start: *"\{0,1\}\([0-9-]*\).*/\1/p' "$cfg")
+          until=$(sed -n 's/^live_until: *"\{0,1\}\([0-9-]*\).*/\1/p' "$cfg")
+          if [ -n "$FORCE" ]; then
+            echo "started by hand with force"
+          elif [ "$on" != true ]; then
+            echo "done=true" >> "$GITHUB_OUTPUT"; echo "live watching is switched off; nothing to do"
+          elif { [ -n "$start" ] && [[ "$today" < "$start" ]]; } || { [ -n "$until" ] && [[ "$today" > "$until" ]]; }; then
+            echo "done=true" >> "$GITHUB_OUTPUT"; echo "live watching is not on for today; nothing to do"
+          fi
+
+      - name: Link them into place
+        if: steps.guard.outputs.done != 'true'
+        run: |
+          ln -s private/config config
+          ln -s private/data data
+          mkdir -p data/logs
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.done != 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Tools
+        if: steps.guard.outputs.done != 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg unzip > /dev/null
+          pip install -q -r requirements.txt yt-dlp
+          mkdir -p tools
+          curl -sSL -o /tmp/tdl.zip https://github.com/lay295/TwitchDownloader/releases/download/1.56.5/TwitchDownloaderCLI-1.56.5-Linux-x64.zip
+          echo "f2bcee00d0e6da759d97c23767345634cb9cdb10cdff96cfa96f97983d51bf55  /tmp/tdl.zip" | sha256sum -c -
+          unzip -q -o /tmp/tdl.zip TwitchDownloaderCLI -d tools && chmod +x tools/TwitchDownloaderCLI
+
+      - name: OpenShorts
+        if: steps.guard.outputs.done != 'true'
+        run: |
+          git clone -q https://github.com/mutonby/openshorts.git vendor/openshorts
+          git -C vendor/openshorts checkout -q "$OPENSHORTS_COMMIT"
+          cp deploy/openshorts.override.yml vendor/openshorts/docker-compose.override.yml
+          cd vendor/openshorts
+          mkdir -p uploads output && chmod -R a+rwX .
+          docker compose build backend > /tmp/build.log 2>&1 || { tail -40 /tmp/build.log; exit 1; }
+          docker compose up -d --no-build backend
+
+      - name: Keys
+        if: steps.guard.outputs.done != 'true'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          UPLOAD_POST_API_KEY: ${{ secrets.UPLOAD_POST_API_KEY }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+        run: |
+          umask 077
+          printf 'GEMINI_API_KEY=%s\nUPLOAD_POST_API_KEY=%s\nTWITCH_CLIENT_ID=%s\nTWITCH_CLIENT_SECRET=%s\n' \
+            "$GEMINI_API_KEY" "$UPLOAD_POST_API_KEY" "$TWITCH_CLIENT_ID" "$TWITCH_CLIENT_SECRET" > .env
+          test -n "$GEMINI_API_KEY" || { echo "the keys are not set in this repository's secrets"; exit 1; }
+
+      - name: Watch
+        if: steps.guard.outputs.done != 'true'
+        env:
+          HOURS: ${{ inputs.hours || '5' }}
+          MIN_SCORE: ${{ inputs.dry_run && inputs.min_score || '' }}
+        run: |
+          [[ "$HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || HOURS=5
+          HOURS=$(python -c "print(min(5.0, max(0.1, float('$HOURS'))))")
+          args=(--quiet --hours "$HOURS")
+          [ -n "$FORCE" ] && args+=(--force)
+          if [ -n "$DRY" ]; then export CLIP_DRY_RUN=1; echo "trial: nothing will be posted"; fi
+          [[ "$MIN_SCORE" =~ ^[0-9]+$ ]] && export CLIP_LIVE_MIN_SCORE="$MIN_SCORE"
+          # While it runs, the watcher saves its records itself, but only to the real
+          # branch: a trial's records are saved once, at the end.
+          [ "$STATE_BRANCH" = main ] && export LIVE_SYNC="$PWD/deploy/save_state.sh"
+          python src/live.py "${args[@]}"
+
+      - name: Save the records
+        if: always() && steps.guard.outputs.done != 'true'
+        run: bash deploy/save_state.sh "Live watcher $(date '+%F %H:%M')"
+
+      # The next run, if the settings still want one. Read after saving, so a
+      # switch-off the owner pushed while this run was going is seen.
+      - name: Start the next run
+        if: success() && steps.guard.outputs.done != 'true' && (github.event_name == 'schedule' || (inputs.chain && !inputs.dry_run))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if python src/live.py --should-run > /dev/null; then
+            gh workflow run live.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+              -f dry_run=false -f chain=true -f hours=5 -f state_branch=main
+            echo "the next run was started"
+          else
+            echo "switched off in the settings; not starting another run"
+          fi

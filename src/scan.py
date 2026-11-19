@@ -216,12 +216,8 @@ def moments_for_vod(vod: dict, viewer_clips: list[dict], per_vod: int) -> list[d
     return sorted(by_chat + by_view, key=lambda m: m["score"], reverse=True)
 
 
-def scan(a) -> None:
-    streamers = load_streamers(a.streamer)
-    tw = twitch_client(required=False)
-    if not tw and any(s.get("twitch") for s in streamers):
-        print("note: no Twitch API credentials in .env, so viewer clips are not counted (chat only)\n")
-
+def load_rules() -> dict:
+    """The owner's limits and today's featured game, from config/posting.yaml."""
     posting = yaml.safe_load((ROOT / "config" / "posting.yaml").read_text())
     rules = {"auto_approve": bool(posting.get("auto_approve")),
              "skip_channels": {str(c).lower() for c in posting.get("skip_channels") or []},
@@ -236,12 +232,28 @@ def scan(a) -> None:
              "focus_game": featured_today(posting)[0],
              "focus_min_clips": featured_today(posting)[1],
              "focus_phase": featured_today(posting)[2]}
-    streamers = [s for s in streamers if str(s.get("twitch", "")).lower() not in rules["skip_channels"]]
+    return rules
+
+
+def find_moments(streamers: list[dict], a, rules: dict, tw: Twitch | None) -> list[dict]:
+    """Every moment worth a look in these streamers' recent streams, strongest first."""
     found = []
     t_scan = progress.report("Scanning streamers", 0, len(streamers), streamers[0]["name"], step_seconds=40)
     for n, s in enumerate(streamers):
         progress.report("Scanning streamers", n, len(streamers), s["name"], started_at=t_scan, step_seconds=40)
         vods, clips = recent_vods(s, tw, a.days, a.vods * 3)
+        # A stream that is live right now: Twitch's listing of its recording can
+        # lag behind by many minutes, so its length is taken from the clock (less
+        # the minute and a half the recording trails the broadcast).
+        if s.get("live_since"):
+            try:
+                went_live = dt.datetime.fromisoformat(str(s["live_since"]).replace("Z", "+00:00"))
+            except ValueError:
+                went_live = None
+            for v in vods:
+                born = started_at(v)
+                if went_live and born and abs((born - went_live).total_seconds()) < 900:
+                    v["seconds"] = max(v["seconds"], (NOW() - born).total_seconds() - 90)
         # A marathon stream's whole chat log is too large to be worth the wait, and
         # launch days are mostly marathons: read its last hours, the freshest part.
         # Clips viewers made earlier in it still count as moments of their own.
@@ -297,7 +309,18 @@ def scan(a) -> None:
                               "vod_url": v["url"], "vod_title": v["title"]})
     found.sort(key=lambda m: m["score"], reverse=True)
     progress.report("Scanning streamers", len(streamers), len(streamers), "done", started_at=t_scan, finished=True)
+    return found
 
+
+def scan(a) -> None:
+    streamers = load_streamers(a.streamer)
+    tw = twitch_client(required=False)
+    if not tw and any(s.get("twitch") for s in streamers):
+        print("note: no Twitch API credentials in .env, so viewer clips are not counted (chat only)\n")
+
+    rules = load_rules()
+    streamers = [s for s in streamers if str(s.get("twitch", "")).lower() not in rules["skip_channels"]]
+    found = find_moments(streamers, a, rules, tw)
     out = ROOT / "data" / "scan" / f"{dt.date.today():%Y-%m-%d}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(found, indent=1))
@@ -321,8 +344,13 @@ def scan(a) -> None:
         make_clips(found, rules, a)
 
 
-def make_clips(found: list[dict], rules: dict, a) -> None:
-    """Judge the best of `found` and make `a.make` clips from what passes."""
+def make_clips(found: list[dict], rules: dict, a) -> int:
+    """Judge the best of `found` and make `a.make` clips from what passes. Returns
+    how many were made.
+
+    Two optional rules are for the live watcher, which only wants the featured
+    game and only its strongest moments: `only_featured` (nothing else is made,
+    not even as cover) and `min_rank` (the judge's rating a clip must reach)."""
     # Never look at the same moment twice: anything overlapping a window that
     # was already clipped, or already judged and rejected, is skipped.
     done: list[tuple[str, float, float]] = []
@@ -360,7 +388,7 @@ def make_clips(found: list[dict], rules: dict, a) -> None:
         candidates.append(m)
     if not candidates:
         print("\nno new moments to look at (everything strong was already clipped or rejected)")
-        return
+        return 0
 
     # Chat is not the only witness. On ten streams chat bursts caught 37% of the
     # moments viewers clipped (64% by clip views; study of 2026-11-16). So moments
@@ -532,6 +560,10 @@ def make_clips(found: list[dict], rules: dict, a) -> None:
             feed = any(w in m["streamer"].lower() for w in rules["tournament_words"])
             if feed and tournament >= rules["max_tournament_clips"]:
                 continue                       # enough from tournament broadcasts today
+            if rules.get("only_featured") and not confirmed(m):
+                continue
+            if float((m.get("verdict") or {}).get("rank", 99)) < float(rules.get("min_rank", 0)):
+                continue                       # passed, but not strong enough to post unasked
             if focus and not confirmed(m):
                 # Leave room for the featured clips still to come.
                 still = sum(1 for j, (x, _) in enumerate(order) if j not in tried and confirmed(x)
@@ -575,6 +607,7 @@ def make_clips(found: list[dict], rules: dict, a) -> None:
         # key, the clipper), not just a quiet day. Fail loudly so the run is
         # marked failed and its owner hears about it.
         sys.exit("error: there were candidates but no clip could be made")
+    return made
 
 
 AUTO_LIST = ROOT / "config" / "watchlist.auto.yaml"
