@@ -138,9 +138,11 @@ def main() -> None:
     if not a.round and not a.force and today_log.exists() and "daily run finished" in today_log.read_text().splitlines():
         sys.exit("today's run already finished (use --force to run again)")
 
-    cfg = yaml.safe_load((ROOT / "config" / "posting.yaml").read_text())
-    if os.environ.get("CLIP_DRY_RUN"):       # a trial: make and plan, send nothing
-        cfg["auto_post"] = False
+    # The settings as the posting code reads them: a trial sends nothing, and
+    # while live posting covers the night the day has fewer slots to fill.
+    sys.path.insert(0, str(ROOT / "src" / "publish"))
+    import post as posting
+    cfg = posting.config()
     if a.round:
         (ROOT / "data" / "logs").mkdir(parents=True, exist_ok=True)
         run_round(a, cfg, today_log)
@@ -160,7 +162,8 @@ def main() -> None:
         today = dt.date.today().isoformat()
         try:
             made = sum(1 for i in json.loads((ROOT / "data" / "queue.json").read_text())
-                       if str(i.get("created", ""))[:10] == today and i.get("status") != "skipped")
+                       if str(i.get("created", ""))[:10] == today and i.get("status") != "skipped"
+                       and not i.get("live"))             # the night's live clips are not the day's clips
         except (OSError, ValueError):
             made = 0
         left = n if a.force else max(0, n - made)        # --force: run the whole day again

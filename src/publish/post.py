@@ -32,10 +32,22 @@ TRACKER = ROOT / "tracker.csv"
 
 
 # --------------------------------------------------------------------------- #
+def live_on(cfg: dict, day: dt.date) -> bool:
+    """Is live posting (src/live.py) switched on for this date?"""
+    start, until = str(cfg.get("live_start") or ""), str(cfg.get("live_until") or "")
+    return bool(cfg.get("live")) and (not start or start <= day.isoformat()) and (not until or day.isoformat() <= until)
+
+
 def config() -> dict:
     cfg = yaml.safe_load((ROOT / "config" / "posting.yaml").read_text())
     if os.environ.get("CLIP_DRY_RUN"):       # a trial: nothing is sent, whatever the file says
         cfg["auto_post"] = False
+    # While live posting covers the coming night, the daily run fills only the
+    # slots outside it (`live_day_slots`), and makes that many clips.
+    tomorrow = dt.datetime.now(ZoneInfo(cfg["timezone"])).date() + dt.timedelta(days=1)
+    if cfg.get("live_day_slots") and live_on(cfg, tomorrow):
+        cfg["slots"] = [str(x) for x in cfg["live_day_slots"]]
+        cfg["clips_per_day"] = len(cfg["slots"])
     return cfg
 
 
@@ -472,70 +484,59 @@ def post_now(cfg: dict, items: list[dict], ids: list[str]) -> None:
         save(items)
 
 
-def live_room(cfg: dict, items: list[dict], now: dt.datetime) -> tuple[bool, str]:
-    """May the live watcher post another clip right now? -> (yes or no, why not).
+def live_room(cfg: dict, items: list[dict], when: dt.datetime) -> tuple[bool, str]:
+    """May a live clip be placed at `when`? -> (yes or no, why not).
 
-    At most `live_max_per_day` live clips on one calendar day and at least
-    `live_gap_minutes` between two of them, so a busy night cannot flood the pages."""
+    Not if another clip already holds that time (within 20 minutes of it), and
+    not beyond `live_max_per_day` live clips on that calendar day."""
     tz = ZoneInfo(cfg["timezone"])
-    out = sorted(dt.datetime.fromisoformat(i["scheduled_for"]).astimezone(tz) for i in items
-                 if i.get("live") and i["status"] in ("scheduled", "posted") and i.get("scheduled_for"))
-    today = [t for t in out if t.date() == now.astimezone(tz).date()]
-    most = int(cfg.get("live_max_per_day", 3))
-    if len(today) >= most:
-        return False, f"{len(today)} live clips went out today already (the limit is {most})"
-    gap = float(cfg.get("live_gap_minutes", 90))
-    if out and (now - out[-1]).total_seconds() < gap * 60:
-        return False, f"the last live clip went out {int((now - out[-1]).total_seconds() // 60)} minutes ago (the gap is {gap:g})"
+    placed = [(dt.datetime.fromisoformat(i["scheduled_for"]).astimezone(tz), i) for i in items
+              if i["status"] in ("ready", "scheduled", "posted") and i.get("scheduled_for")]
+    for t, i in placed:
+        if abs((t - when).total_seconds()) < 20 * 60:
+            return False, f"{i['id']} is already placed at {t:%H:%M}"
+    day = [1 for t, i in placed if i.get("live") and t.date() == when.astimezone(tz).date()]
+    most = int(cfg.get("live_max_per_day", 8))
+    if len(day) >= most:
+        return False, f"{len(day)} live clips are placed on that day already (the limit is {most})"
     return True, ""
 
 
-def post_live(cfg: dict, items: list[dict], really: bool) -> int:
-    """Publish the live watcher's new clip at once, in place of the next scheduled one.
-
-    The clip goes out first. Only when Upload-Post has accepted it is the next
-    scheduled clip withdrawn, so a failed upload never costs a post. Returns how
-    many clips went out (or would have, in a trial)."""
+def post_live(cfg: dict, items: list[dict], really: bool, when: dt.datetime | None = None) -> int:
+    """Hand the live run's new clip to Upload-Post for `when` (the top of the
+    hour), or publish it at once if that time is less than three minutes away or
+    already past. Nothing else in the queue is touched. Returns how many clips
+    were placed (or would have been, in a trial)."""
     tz = ZoneInfo(cfg["timezone"])
-    now = dt.datetime.now(tz)
     new = [i for i in items if i.get("live") and i["status"] == "ready" and not i["scheduled_for"]]
     sent = 0
     for i in new:
-        ok, why = live_room(cfg, items, now)
-        nxt = min((x for x in items if x["status"] == "scheduled" and not x.get("live") and x.get("scheduled_for")
-                   and dt.datetime.fromisoformat(x["scheduled_for"]) > now + dt.timedelta(minutes=2)),
-                  key=lambda x: x["scheduled_for"], default=None)
+        now = dt.datetime.now(tz)
+        at = when if when and when - now >= dt.timedelta(minutes=3) else None
+        ok, why = live_room(cfg, items, when or now)
         if not ok:
             i["status"], i["note"] = "skipped", f"made live but not posted: {why}"
             print(f"NOT POSTED  {i['id']}  ({why})")
             save(items)
             continue
+        dress(i, items)
         if not really:
-            dress(i, items)
-            print(f"would post now  {i['id']}  {i.get('streamer', '')}  -> {', '.join(cfg['platforms'])}")
-            if nxt:
-                print(f"would withdraw  {nxt['id']}  {dt.datetime.fromisoformat(nxt['scheduled_for']):%a %d %b %H:%M}"
-                      f"  ({i['id']} goes out in its place)")
+            print(f"would post {'at ' + format(at, '%H:%M') if at else 'now'}  {i['id']}  {i.get('streamer', '')}"
+                  f"  -> {', '.join(cfg['platforms'])}")
             i["status"], i["note"] = "skipped", "trial: would have been posted live"
             save(items)
             sent += 1
             continue
-        dress(i, items)
-        post_now(cfg, items, [i["id"]])
-        if i["status"] != "scheduled":
-            continue                           # the upload failed; nothing else is touched
-        sent += 1
-        if nxt:
-            when = dt.datetime.fromisoformat(nxt["scheduled_for"]).strftime("%a %d %b %H:%M")
-            try:
-                job = (nxt.get("response") or {}).get("job_id")
-                if job:
-                    client().cancel_scheduled(job)
-                nxt["status"], nxt["scheduled_for"] = "skipped", None
-                nxt["note"] = f"withdrawn: live clip {i['id']} went out in its place"
-                print(f"WITHDRAW  {nxt['id']}  {when}  ({i['id']} went out in its place)")
-            except Exception as e:
-                print(f"      could not withdraw {nxt['id']} ({str(e)[:160]}); it still goes out at {when}")
+        if at:
+            i["scheduled_for"] = at.isoformat()
+            for x in items:                    # send only this clip
+                x["_held"] = x is not i
+            send(cfg, items, really=True)
+            for x in items:
+                x.pop("_held", None)
+        else:
+            post_now(cfg, items, [i["id"]])
+        sent += 1 if i["status"] == "scheduled" else 0
         save(items)
     return sent
 
@@ -816,7 +817,7 @@ def main() -> None:
     k.add_argument("ids", nargs="+")
     k = sub.add_parser("skip")
     k.add_argument("id")
-    sub.add_parser("live", help="publish the live watcher's new clip now, in place of the next scheduled one")
+    sub.add_parser("live", help="publish the live run's new clip now")
     sub.add_parser("check", help="confirm that every post whose slot has passed went out")
     sub.add_parser("stats")
     sub.add_parser("report")

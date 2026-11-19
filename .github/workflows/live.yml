@@ -1,41 +1,43 @@
-# The live watcher: for a few hours at a time, look at the featured game's live
-# streams every few minutes and post a strong moment while the stream is still
-# going (src/live.py). Each run starts the next one when it ends, for as long as
-# the private settings say `live: true` and today is inside live_start..live_until.
+# Live posting: through the hours listed in the private settings (live_hours),
+# make a clip from a stream of the featured game that is live right now and post
+# it at the top of each hour (src/live.py). A run works for up to five hours and
+# starts the next one itself while there is another hour to do that night.
 #
-# To stop it: set `live: false` in the private settings (it stops within half an
-# hour and does not start again), or disable this workflow.
+# To stop it: set `live: false` in the private settings (it stops before the
+# next hour and does not start again), or disable this workflow.
 #
 # Nothing about individual clips or streamers is printed here, because this log
-# is public: only how many streams were looked at and whether a clip went out.
+# is public: only the posting times worked on and whether a clip was placed.
 name: live
 
 on:
-  # A safety net only: if the chain of runs breaks, one of these picks it up.
-  # GitHub's timer is best-effort, and outside the dates in the settings a start
-  # ends in seconds. A start while a watcher is running waits for it to finish.
+  # GitHub's timer is best-effort, so the night's first run gets four chances
+  # and there is a net every two hours in case the chain of runs breaks. A start
+  # with no posting time coming up ends in seconds; a start while a run is going
+  # waits for it to finish. (Times in UTC; Cairo is two hours ahead in winter.)
   schedule:
+    - cron: "53 21 * * *"         # 23:53 in Cairo
+    - cron: "8 22 * * *"          # 00:08
+    - cron: "23 22 * * *"         # 00:23
+    - cron: "38 22 * * *"         # 00:38
     - cron: "23 */2 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Watch, judge and make clips but post nothing"
+        description: "Judge and make clips but post nothing"
         type: boolean
         default: true
       hours:
-        description: "How long this run watches (at most 5)"
+        description: "How long this run works (at most 5)"
         default: "5"
       chain:
         description: "Start the next run when this one ends (real runs only)"
         type: boolean
         default: false
       force:
-        description: "Watch even if the settings have it switched off (for trials)"
+        description: "Trial: treat every full hour as a live hour, whatever the settings say"
         type: boolean
         default: false
-      min_score:
-        description: "Trial only: a lower bar for a moment to reach the judge, to exercise every step"
-        default: ""
       state_branch:
         description: "Branch of the private repository to save the records to"
         default: "main"
@@ -56,7 +58,7 @@ env:
   OPENSHORTS_COMMIT: 8af4a48a2bdda96c9a02bb8df3f09d4e7ec99e0f
   OPENSHORTS_SERVICES: backend
   STATE_BRANCH: ${{ inputs.state_branch || 'main' }}
-  STATE_AUTHOR: stream-clipper live watcher
+  STATE_AUTHOR: stream-clipper live posting
   DRY: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '' }}
   FORCE: ${{ inputs.force && '1' || '' }}
 
@@ -74,21 +76,34 @@ jobs:
           ssh-key: ${{ secrets.STATE_DEPLOY_KEY }}
           path: private
 
-      - name: Switched on?
+      - name: Anything to do?
         id: guard
         run: |
-          cfg=private/config/posting.yaml
-          today=$(date +%F)
-          on=$(sed -n 's/^live: *\([a-z]*\).*/\1/p' "$cfg")
-          start=$(sed -n 's/^live_start: *"\{0,1\}\([0-9-]*\).*/\1/p' "$cfg")
-          until=$(sed -n 's/^live_until: *"\{0,1\}\([0-9-]*\).*/\1/p' "$cfg")
-          if [ -n "$FORCE" ]; then
-            echo "started by hand with force"
-          elif [ "$on" != true ]; then
-            echo "done=true" >> "$GITHUB_OUTPUT"; echo "live watching is switched off; nothing to do"
-          elif { [ -n "$start" ] && [[ "$today" < "$start" ]]; } || { [ -n "$until" ] && [[ "$today" > "$until" ]]; }; then
-            echo "done=true" >> "$GITHUB_OUTPUT"; echo "live watching is not on for today; nothing to do"
-          fi
+          # Is there a posting time whose work starts within the next 75 minutes?
+          # (The same rule as `live.py --should-run`, without installing anything.)
+          if [ -n "$FORCE" ]; then echo "a trial, started by hand"; exit 0; fi
+          python3 - << 'PY' >> "$GITHUB_OUTPUT"
+          import datetime as dt, re
+          text = open("private/config/posting.yaml").read()
+          def one(key, default=""):
+              m = re.search(rf'^{key}:\s*"?([^"#\n]*)"?', text, re.M)
+              return m.group(1).strip() if m else default
+          line = re.search(r"^live_hours:(.*)$", text, re.M)
+          hours = re.findall(r"\d\d:\d\d", line.group(1).split("#")[0]) if line else []
+          lead = float(one("live_lead_minutes", "25") or 25)
+          now = dt.datetime.now()                    # TZ is set to the settings' zone
+          soon = False
+          for day in (now.date(), now.date() + dt.timedelta(days=1)):
+              d = day.isoformat()
+              if one("live") != "true" or (one("live_start") and d < one("live_start")) or (one("live_until") and d > one("live_until")):
+                  continue
+              for h in hours:
+                  when = dt.datetime.combine(day, dt.time.fromisoformat(h))
+                  if when - now > dt.timedelta(minutes=8) and when - dt.timedelta(minutes=lead) - now <= dt.timedelta(minutes=75):
+                      soon = True
+          print("done=false" if soon else "done=true")
+          PY
+          grep -q "done=true" "$GITHUB_OUTPUT" && echo "no posting time coming up; nothing to do" || echo "there is a posting time coming up"
 
       - name: Link them into place
         if: steps.guard.outputs.done != 'true'
@@ -136,26 +151,24 @@ jobs:
             "$GEMINI_API_KEY" "$UPLOAD_POST_API_KEY" "$TWITCH_CLIENT_ID" "$TWITCH_CLIENT_SECRET" > .env
           test -n "$GEMINI_API_KEY" || { echo "the keys are not set in this repository's secrets"; exit 1; }
 
-      - name: Watch
+      - name: Live posting
         if: steps.guard.outputs.done != 'true'
         env:
           HOURS: ${{ inputs.hours || '5' }}
-          MIN_SCORE: ${{ inputs.dry_run && inputs.min_score || '' }}
         run: |
           [[ "$HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || HOURS=5
           HOURS=$(python -c "print(min(5.0, max(0.1, float('$HOURS'))))")
           args=(--quiet --hours "$HOURS")
           [ -n "$FORCE" ] && args+=(--force)
           if [ -n "$DRY" ]; then export CLIP_DRY_RUN=1; echo "trial: nothing will be posted"; fi
-          [[ "$MIN_SCORE" =~ ^[0-9]+$ ]] && export CLIP_LIVE_MIN_SCORE="$MIN_SCORE"
-          # While it runs, the watcher saves its records itself, but only to the real
-          # branch: a trial's records are saved once, at the end.
+          # While it runs it saves its records itself, but only to the real branch: a
+          # trial's records are saved once, at the end.
           [ "$STATE_BRANCH" = main ] && export LIVE_SYNC="$PWD/deploy/save_state.sh"
           python src/live.py "${args[@]}"
 
       - name: Save the records
         if: always() && steps.guard.outputs.done != 'true'
-        run: bash deploy/save_state.sh "Live watcher $(date '+%F %H:%M')"
+        run: bash deploy/save_state.sh "Live posting $(date '+%F %H:%M')"
 
       # The next run, if the settings still want one. Read after saving, so a
       # switch-off the owner pushed while this run was going is seen.
@@ -169,5 +182,5 @@ jobs:
               -f dry_run=false -f chain=true -f hours=5 -f state_branch=main
             echo "the next run was started"
           else
-            echo "switched off in the settings; not starting another run"
+            echo "no posting time coming up (or switched off); not starting another run"
           fi
