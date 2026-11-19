@@ -38,6 +38,9 @@ on:
         description: "Trial: treat every full hour as a live hour, whatever the settings say"
         type: boolean
         default: false
+      max_wait:
+        description: "Test: an idle run waits at most this many minutes before starting the next run"
+        default: ""
       state_branch:
         description: "Branch of the private repository to save the records to"
         default: "main"
@@ -89,8 +92,10 @@ jobs:
         if: steps.guard.outputs.mode == 'idle'
         env:
           SECONDS_TO_WAIT: ${{ steps.guard.outputs.seconds }}
+          MAX_WAIT: ${{ inputs.max_wait }}
         run: |
           [[ "$SECONDS_TO_WAIT" =~ ^[0-9]+$ ]] || SECONDS_TO_WAIT=60
+          if [[ "$MAX_WAIT" =~ ^[0-9]+$ ]] && [ $((MAX_WAIT * 60)) -lt "$SECONDS_TO_WAIT" ]; then SECONDS_TO_WAIT=$((MAX_WAIT * 60)); fi
           echo "waiting $((SECONDS_TO_WAIT / 60)) minutes; nothing is set up or posted by this run"
           sleep "$SECONDS_TO_WAIT"
 
