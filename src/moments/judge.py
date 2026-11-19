@@ -151,8 +151,12 @@ Watch and listen to the whole video, then decide.
      most 90 characters ("Right call to push with 12 seconds left?"). Not "thoughts?",
      not "who did it better?", nothing that just asks for likes, comments or follows.
      Empty string if there is no real question.
-   - game_label_ok: true if the game or category named above is what is actually on screen;
-     false if a different game or activity is being shown.
+   - game_label_ok: judge it on YOUR cut only. For a game: true if that game's gameplay or
+     menus are on screen, or the streamer is plainly reacting to or talking about that
+     game. false if a different game is shown, or if the stream has left the game: real
+     life seen through a camera (a street, an arena, a shop, people met outside), another
+     activity, or talk about something unrelated. A stream titled after a game is not
+     evidence; only what is seen and heard in the cut counts.
 """
 
 

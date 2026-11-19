@@ -317,8 +317,12 @@ def scan(a) -> None:
               f"{m['score']:>6}  {m['why']:<30} {' | '.join(m['sample'])[:60]}")
     print(f"\nsaved {len(found)} moments to {out}")
 
-    if not a.make:
-        return
+    if a.make:
+        make_clips(found, rules, a)
+
+
+def make_clips(found: list[dict], rules: dict, a) -> None:
+    """Judge the best of `found` and make `a.make` clips from what passes."""
     # Never look at the same moment twice: anything overlapping a window that
     # was already clipped, or already judged and rejected, is skipped.
     done: list[tuple[str, float, float]] = []
@@ -383,9 +387,19 @@ def scan(a) -> None:
     if focus and rules["focus_min_clips"] > 0:
         ours, rest = [m for m in candidates if featured(m)], [m for m in candidates if not featured(m)]
         if rules["focus_phase"] == "all":
-            # Every clip of the day should be the featured game: its moments first,
-            # two others at the front of the rest as cover if too few of them pass.
-            candidates = ours[:7] + rest[:2] + ours[7:] + rest[2:]
+            # Every clip of the day should be the featured game. Its moments come
+            # first, one streamer after another (each streamer's best, then each
+            # one's second best ...), so one long stream cannot fill the pool. The
+            # others follow and are only looked at if too few of ours pass (below).
+            by_streamer: dict[str, list[dict]] = defaultdict(list)
+            for m in ours:
+                by_streamer[m["streamer"]].append(m)
+            ours = []
+            while any(by_streamer.values()):
+                for name in list(by_streamer):
+                    if by_streamer[name]:
+                        ours.append(by_streamer[name].pop(0))
+            candidates = ours + rest
         else:
             candidates = []
             while ours or rest:
@@ -410,16 +424,40 @@ def scan(a) -> None:
                 "--streamer", m["streamer"], "--game", m.get("game", ""),
                 "--score", str(m["score"]), "--moment", str(spec), *extra]
 
+    # Launch week: the judge turns down a good share of the featured game's
+    # moments (on launch day, three of the first seven for nudity) and some
+    # "moments" in a game stream are not the game at all. So keep looking at the
+    # featured game's moments until enough passed AND are really the game, up to
+    # `ours_limit`; only then, if still short, look at up to `cover` others.
+    all_ours = bool(focus) and rules["focus_phase"] == "all" and rules["focus_min_clips"] > 0
+    ours_limit = min(sum(1 for m in candidates if featured(m)), 12 if want > 1 else 5) if all_ours else 0
+    enough = want + 2 if want > 1 else 2
+    cover = 2 if want > 1 else 1
+    if all_ours:
+        pool = min(len(candidates), ours_limit + cover)
+
+    def is_ours(m: dict) -> bool:
+        return featured(m) and (m.get("verdict") or {}).get("game_label_ok", True)
+
     total = pool + want
     t0 = progress.report("Finding the best moments", 0, total, "starting", step_seconds=150)
     kept, unjudged, seen_per = [], [], defaultdict(int)
-    looked = 0
+    looked = looked_ours = looked_rest = 0
     for m in candidates:
         if looked >= pool:
             break
+        if all_ours:
+            good = sum(1 for k, _ in kept if is_ours(k))
+            if featured(m):
+                if looked_ours >= ours_limit or good >= enough:
+                    continue
+            elif good >= want or looked_rest >= cover:
+                continue
         # No point judging a fifth moment from a streamer we will use twice at most.
         if seen_per[m["streamer"]] >= rules["max_per_streamer"] * 2:
             continue
+        looked_ours += 1 if featured(m) else 0
+        looked_rest += 0 if featured(m) else 1
         seen_per[m["streamer"]] += 1
         looked += 1
         label = f"{m['streamer']} at {hms(m['burst_start'])}"
