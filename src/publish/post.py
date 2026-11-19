@@ -143,8 +143,10 @@ def plan_fresh(cfg: dict, items: list[dict], now: dt.datetime) -> tuple[list[dic
         day += dt.timedelta(days=1)
     keep_days = float(cfg.get("reserve_days", 3))
 
-    fresh = by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"]])
-    reserve = [i for i in items if i["status"] == "scheduled" and i.get("scheduled_for")
+    # The night's live clips have their own times (post_live); they are never
+    # planned, moved or withdrawn here.
+    fresh = by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"] and not i.get("live")])
+    reserve = [i for i in items if i["status"] == "scheduled" and i.get("scheduled_for") and not i.get("live")
                and dt.datetime.fromisoformat(i["scheduled_for"]) > soon]
     reserve.sort(key=lambda i: ((i.get("judge") or {}).get("overall", 0), float(i.get("score") or 0)), reverse=True)
 
@@ -190,7 +192,8 @@ def plan_round(cfg: dict, items: list[dict], now: dt.datetime) -> list[dict]:
         slots += [w for w in (dt.datetime.combine(day, t, tz) for t in times) if w >= soon]
         day += dt.timedelta(days=1)
     placed = []
-    for item in by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"]]):
+    for item in by_streamer([i for i in items if i["status"] == "ready" and not i["scheduled_for"]
+                             and not i.get("live")]):
         item["scheduled_for"] = slots.pop(0).isoformat()
         dress(item, items)
         placed.append(item)
