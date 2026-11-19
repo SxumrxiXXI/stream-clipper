@@ -160,6 +160,32 @@ Watch and listen to the whole video, then decide.
 """
 
 
+
+class Picture(BaseModel):
+    seen: str
+    hud: str
+    picture: str
+
+
+# Asked on its own, after the main verdict. Inside the long prompt the model went
+# along with the stream's listing: on GTA VI's launch day it passed a walk down a
+# real street as "GTA VI". Asked only this, it was right 12 times out of 12.
+PICTURE = """Look at the main picture of this stream video between {a} and {b} (ignore the small chat box
+and overlays the streamer added). The stream is listed under "{game}", but streamers often leave
+the game without changing the listing, so do not trust that.
+- seen: one sentence on what the main picture shows.
+- hud: which video-game interface elements are visible in the main picture (minimap or radar,
+  health or ammo display, button prompts, menus, a game character seen from behind), or "none".
+- picture: exactly one of
+    "game"       the main picture is rendered video-game graphics, with or without a small face camera
+    "real_life"  the main picture is filmed with a real camera away from the streamer's desk: a street,
+                 a venue, a car, a shop, people met in person
+    "desk"       the main picture is the streamer at their desk or in their room on camera, no game picture
+    "other"      a video, a web page or anything else
+"""
+NOT_GAMES = {"", "unknown", "just chatting", "irl", "always on", "special events", "talk shows & podcasts"}
+
+
 def mmss(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
@@ -230,6 +256,17 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
                 if attempt:
                     raise
                 time.sleep(8)
+        v["picture"], extra = "", None
+        if game.strip().lower() not in NOT_GAMES:
+            try:
+                seen = client.models.generate_content(
+                    model=model, contents=[up, PICTURE.format(a=v.get("start"), b=v.get("end"), game=game)],
+                    config=types.GenerateContentConfig(response_mime_type="application/json",
+                                                       response_schema=Picture, temperature=0.0))
+                v["picture"] = str(json.loads(seen.text).get("picture", "")).strip().lower()
+                extra = getattr(seen, "usage_metadata", None)
+            except Exception:
+                pass                        # unanswered: the main verdict's own check stands
     finally:
         try:
             client.files.delete(name=up.name)
@@ -270,7 +307,8 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
             words.pop()
     v["hook"] = " ".join(words).strip()
     v["question"] = str(v.get("question") or "").strip()[:110]
-    v["game_label_ok"] = bool(v.get("game_label_ok", True))
+    # A game stream that has gone outside is not that game, whatever its listing says.
+    v["game_label_ok"] = bool(v.get("game_label_ok", True)) and v.get("picture") != "real_life"
     # The yes/no facts gate the clip; the scores only rank what passes.
     reasons = []
     if v.get("sexual_content"):
@@ -299,8 +337,8 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
     v["rank"] = round(0.35 * v["payoff"] + 0.3 * v["opening"] + 0.2 * v["standalone"] + 0.15 * v["overall"]
                       + (0.5 if v["reaction_in_clip"] else 0), 2)
     usage = getattr(resp, "usage_metadata", None)
-    tokens_in = getattr(usage, "prompt_token_count", 0) or 0
-    tokens_out = getattr(usage, "candidates_token_count", 0) or 0
+    tokens_in = (getattr(usage, "prompt_token_count", 0) or 0) + (getattr(extra, "prompt_token_count", 0) or 0)
+    tokens_out = (getattr(usage, "candidates_token_count", 0) or 0) + (getattr(extra, "candidates_token_count", 0) or 0)
     v["tokens"] = {"in": tokens_in, "out": tokens_out}
     # Flash-Lite list price at the time of writing: $0.25 in, $1.50 out per million tokens.
     v["cost_usd"] = round(tokens_in * 0.25e-6 + tokens_out * 1.5e-6, 5)
