@@ -186,6 +186,37 @@ the game without changing the listing, so do not trust that.
 NOT_GAMES = {"", "unknown", "just chatting", "irl", "always on", "special events", "talk shows & podcasts"}
 
 
+
+def game_names(game: str) -> list[str]:
+    """The ways a game is written in a title: its name, its initials, digits for numerals."""
+    names = {game.strip()}
+    words = game.split()
+    roman = {"II": "2", "III": "3", "IV": "4", "V": "5", "VI": "6", "VII": "7"}
+    if len(words) >= 3:
+        last = words[-1].upper()
+        head = words[:-1] if last in roman or last.isdigit() else words
+        short = "".join(w[0] for w in head if w[0].isalnum()).upper()
+        if len(short) >= 2:
+            names.add(short)
+            if head is not words:
+                names |= {f"{short} {words[-1]}", f"{short}{words[-1]}", " ".join(head)}
+                if last in roman:
+                    names |= {f"{short} {roman[last]}", f"{short}{roman[last]}", f"{' '.join(head)} {roman[last]}"}
+    return sorted((n for n in names if len(n) >= 2), key=len, reverse=True)
+
+
+def without_game(text: str, game: str) -> str:
+    """`text` with "in <game>" taken out; empty if the game is still named after that
+    (or the name was cut off mid-word), so the caller falls back to other wording."""
+    alts = "|".join(re.escape(n) for n in game_names(game))
+    out = re.sub(rf"\s*\b(?:in|on|during|while playing|playing)\s+(?:{alts})\b", "", text, flags=re.I)
+    out = re.sub(r"\s{2,}", " ", out).strip(" ,-|")
+    first = re.escape(game.split()[0]) if game.split() else ""
+    if re.search(rf"\b(?:{alts})\b", out, flags=re.I) or (first and re.search(rf"\b{first}\b", out, flags=re.I)):
+        return ""
+    return out
+
+
 def mmss(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
@@ -309,6 +340,11 @@ def judge(video: Path, duration: float, *, burst: float, chat: list[tuple[float,
     v["question"] = str(v.get("question") or "").strip()[:110]
     # A game stream that has gone outside is not that game, whatever its listing says.
     v["game_label_ok"] = bool(v.get("game_label_ok", True)) and v.get("picture") != "real_life"
+    if not v["game_label_ok"] and game:
+        # The texts were written believing the listing ("... in GTA VI"); take the game out.
+        for field in ("youtube_title", "caption", "hook"):
+            v[field] = without_game(str(v.get(field) or ""), game)
+        v["youtube_title"] = v["youtube_title"] or str(v.get("hook") or "")
     # The yes/no facts gate the clip; the scores only rank what passes.
     reasons = []
     if v.get("sexual_content"):
